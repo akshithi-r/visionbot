@@ -268,6 +268,8 @@ class ArenaMap:
     -> typed ruler scale (or the last marker-derived scale if we had one).
     """
 
+    SCALE_SMOOTH = 0.25  # EMA factor for the marker-derived cm/px scale
+
     def __init__(self, corner_marker_cm=6.0, cm_per_px=0.05):
         self.corner_marker_cm = float(corner_marker_cm)
         self.cm_per_px = float(cm_per_px)
@@ -292,8 +294,13 @@ class ArenaMap:
                 for i in range(4):                     # the marker's 4 sides
                     sides.append(float(np.linalg.norm(q[(i + 1) % 4] - q[i])))
             mean_side_px = sum(sides) / len(sides)
-            scale = self.corner_marker_cm / mean_side_px
-            self.last_scale = scale
+            raw_scale = self.corner_marker_cm / mean_side_px
+            if self.last_scale is None:
+                self.last_scale = raw_scale
+            else:   # EMA smoothing: steadies the number, still tracks real
+                    # changes (a bumped camera) within a few frames
+                self.last_scale += self.SCALE_SMOOTH * (raw_scale - self.last_scale)
+            scale = self.last_scale
             # arena size in cm measured between the taped markers
             self.width_cm = float(np.linalg.norm(centers[1] - centers[0])) * scale
             self.height_cm = float(np.linalg.norm(centers[3] - centers[0])) * scale
@@ -349,8 +356,10 @@ class Navigator:
       1. HYSTERESIS - turn until |err| <= aim_in (~12 deg), then commit to
          driving and don't re-turn until |err| >= angle_tol (~25 deg). The
          gap kills boundary chatter.
-      2. PROPORTIONAL TURN SPEED - far off course: brisk. Near aim: gentle.
-         Overshoot past zero was the main zigzag source at a fixed speed.
+      2. PROPORTIONAL TURN SPEED - far off course: 100% of the drive speed.
+         Near aim: 65%. (Never lower - below ~25% PWM these motors stall and
+         just hum.) Overshoot past zero was the main zigzag source at a
+         fixed speed.
       3. PULSE-STEERING while driving - inside the hysteresis band the robot
          gets short turn pulses between straight ticks (like a servo), so it
          curves gently toward the line instead of slam-turn/overshoot.
@@ -397,10 +406,12 @@ class Navigator:
         return c
 
     def _turn_speed(self, err):
-        """Proportional: 25% of drive speed at the aim edge, 100% at 90 deg."""
+        """Proportional between 65% and 100% of drive speed. The floor is
+        high on purpose: below ~25% PWM these motors just hum (stall) - an
+        earlier 15% floor froze the robot mid-turn with one wheel stopped."""
         frac = min(1.0, abs(err) / 90.0)
-        v = int(0.25 * self.speed + frac * 0.75 * self.speed)
-        return max(150, min(1023, v))
+        v = int((0.65 + 0.35 * frac) * self.speed)
+        return max(250, min(1023, v))
 
     # ---- the decision ----
     def step(self, seen_robot, seen_target, robot_cm, heading_deg, target_cm):
