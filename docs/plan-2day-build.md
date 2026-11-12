@@ -45,11 +45,29 @@ The ESP32 cannot stay powered from the laptop USB while the robot is driving —
 - [ ] Thick card stock: one 12×12 cm destination card + one small plate for the robot's marker
 - [ ] USB power bank + cable (most homes have one)
 - [ ] 4×AA battery holder **with a switch** (and a 6×AA holder for the NiMH pack later)
-- [ ] Camera stand: tripod, lamp arm, or a shelf ~100–110 cm above the arena
+- [ ] Camera mount — pick ONE (details in §2b): cardboard bridge (centered overhead) OR lamp-arm/tripod (angled, from one side)
+- [ ] One big cardboard delivery box (mount material — doubles as the packing box) + a ruler or dowel for a crossbar
 - [ ] Two table lamps (we control the lighting, not the exhibition hall)
 - [ ] Double-sided tape, normal tape, zip ties, scissors
 - [ ] **Software (parent, ~40 min):** Python 3.11+ installed; `pip install opencv-python numpy`; Arduino IDE with ESP32 board support added
 - [ ] Print the two ArUco markers once `code/python/generate_markers.py` is ready (next work session)
+
+### 2b. Camera mounting — you do NOT need a cage
+
+Strictly-centered is *not* required. Two workable setups:
+
+| Setup | How | Notes |
+|---|---|---|
+| **A. Cardboard bridge (easiest)** | Two cardboard towers (or one delivery box cut into an inverted U) at the arena's short edges + a ruler/dowel crossbar; webcam taped to the crossbar pointing straight down, ~100 cm above the arena | Camera sees straight down → uniform scale, most reliable marker detection |
+| **B. Side mount (angled)** | Webcam on a desk-lamp arm / music stand / tripod clamped at one **short** edge of the arena, tilted down over it. Height ≥ the arena dimension pointing away from the camera (≥ 70–80 cm for a 100×70 arena with the short edge facing the camera) | Works because our 4-corner calibration corrects perspective (homography) — positions AND heading come out correct |
+
+Whichever you choose:
+
+- The camera must see **all 4 corners** of the arena.
+- After calibration, tape the camera in place. If it gets bumped (e.g., at the venue), recalibration is just re-clicking 4 corners — about 1 minute.
+- **Detection rule:** the far-edge markers must not be viewed at more than ~45–55° tilt. Higher camera = better detection. (This is why side mounts need height — the math corrects position, but detection itself needs to see the marker's face.)
+- Lock the webcam focus once (Logitech/Camera settings, manual focus) so autofocus doesn't hunt during the demo.
+- If you side-mount, tell the judges — perspective correction is a bonus talking point ("the same idea used to make aerial maps").
 
 ---
 
@@ -110,14 +128,15 @@ GPIOs 0, 2, 12, 15 are deliberately avoided (boot-strapping pins — motors on t
 
 ### Block 4 · Camera + markers (~1.5 h)
 
-1. Mount the webcam ~100–110 cm above the arena, pointing straight down; lock focus (manual focus in the Logitech/Camera settings if available).
+1. Mount the webcam per §2b (bridge or side mount — both fine); lock focus (manual focus in the Logitech/Camera settings if available).
 2. Print markers (ID 10 = robot, ~8 cm; ID 20 = destination, ~8 cm on the card).
 3. Run `code/python/detect_test.py` — live video with boxes + IDs drawn.
-4. Kid slides both markers to every corner of the arena — both IDs must be detected everywhere.
-5. **Pixel→cm scale:** place the two markers exactly 30 cm apart (measure with a ruler), read the pixel distance on screen, scale = 30 ÷ pixels. Write it down in the log.
-6. **Heading sanity check:** point the robot north/south/east/west and note the reported angle each time (we'll use this to fix sign conventions tomorrow — write the 4 numbers down).
+4. Kid slides both markers to every corner of the arena — both IDs must be detected everywhere. (If the far corners miss detection, raise the camera or switch to the bridge mount.)
+5. **Perspective calibration:** run `code/python/calibrate.py` and click the 4 arena corners in order (top-left → top-right → bottom-right → bottom-left, measured in cm from a fixed real corner). This saves the transform — from then on all positions are reported directly in centimetres, and an angled camera is fully corrected.
+6. **Scale check:** place the two markers exactly 30 cm apart with a ruler — the reported distance should read ~30 cm.
+7. **Heading sanity check:** point the robot north/south/east/west and note the reported angle each time (we'll use this to fix sign conventions tomorrow — write the 4 numbers down).
 
-✅ **Checkpoint:** both markers detected in the whole arena, scale written down, 4 heading numbers written down.
+✅ **Checkpoint:** both markers detected in the whole arena, calibration saved, 30 cm reads ~30 cm, 4 heading numbers written down.
 
 **End of Day 1 = wheels work wirelessly AND the camera sees both markers.** If either fails, that's the evening's job — Day 2 depends on both.
 
