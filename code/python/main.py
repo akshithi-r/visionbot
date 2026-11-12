@@ -256,33 +256,51 @@ class CameraFeed:
 
 # =========================================================== arena mapping
 class ArenaMap:
-    """Pixel -> true-cm mapping from the four taped corner markers.
+    """Pixel -> true-cm mapping, derived from the four taped corner markers.
 
-    All four corners visible -> homography recomputed THIS frame (a bumped
-    camera at the venue heals itself). Robot covering one corner -> use the
-    cached last-good homography. No corners at all -> single ruler scale.
+    NOTHING is typed by hand: each corner marker's printed size is known
+    (CORNER_MARKER_CM), the detector gives its 4 corners in pixels, so the
+    cm/px scale falls out - 4 markers x 4 sides = 16 samples averaged per
+    frame (~1% error, self-updating, survives camera bumps).
+
+    All four corners visible -> homography recomputed THIS frame. Robot
+    covering one corner -> cached last-good homography. No corners ever
+    -> typed ruler scale (or the last marker-derived scale if we had one).
     """
 
-    def __init__(self, width_cm=100.0, height_cm=70.0, cm_per_px=0.05):
-        self.width_cm = float(width_cm)
-        self.height_cm = float(height_cm)
+    def __init__(self, corner_marker_cm=6.0, cm_per_px=0.05):
+        self.corner_marker_cm = float(corner_marker_cm)
         self.cm_per_px = float(cm_per_px)
-        self.H = None            # live homography this frame
-        self.last_good_H = None  # cache while a corner is hidden
+        self.width_cm = 0.0
+        self.height_cm = 0.0
+        self.last_scale = None       # cm/px derived from the markers (cached)
+        self.H = None                # live homography this frame
+        self.last_good_H = None      # cache while a corner is hidden
 
-    def configure(self, width_cm, height_cm, cm_per_px):
-        self.width_cm = float(width_cm)
-        self.height_cm = float(height_cm)
+    def configure(self, corner_marker_cm, cm_per_px):
+        self.corner_marker_cm = float(corner_marker_cm)
         self.cm_per_px = float(cm_per_px)
 
     def update(self, found):
         """Call once per frame with all detected markers."""
         if all(cid in found for cid in CORNER_IDS):
-            src = np.array([center_of(found[cid]) for cid in CORNER_IDS],
-                           dtype=np.float32)
-            w, h = self.width_cm, self.height_cm
-            dst = np.array([[0, 0], [w, 0], [w, h], [0, h]], dtype=np.float32)
-            self.H = cv2.getPerspectiveTransform(src, dst)
+            centers = np.array([center_of(found[cid]) for cid in CORNER_IDS],
+                               dtype=np.float32)
+            sides = []
+            for cid in CORNER_IDS:
+                q = found[cid].reshape(4, 2)
+                for i in range(4):                     # the marker's 4 sides
+                    sides.append(float(np.linalg.norm(q[(i + 1) % 4] - q[i])))
+            mean_side_px = sum(sides) / len(sides)
+            scale = self.corner_marker_cm / mean_side_px
+            self.last_scale = scale
+            # arena size in cm measured between the taped markers
+            self.width_cm = float(np.linalg.norm(centers[1] - centers[0])) * scale
+            self.height_cm = float(np.linalg.norm(centers[3] - centers[0])) * scale
+            dst = np.array([[0, 0], [self.width_cm, 0],
+                            [self.width_cm, self.height_cm],
+                            [0, self.height_cm]], dtype=np.float32)
+            self.H = cv2.getPerspectiveTransform(centers, dst)
             self.last_good_H = self.H.copy()
         else:
             self.H = None
@@ -306,7 +324,8 @@ class ArenaMap:
         x toward TR, y toward BL."""
         if self.last_good_H is not None:
             return self._map(p)
-        return (float(p[0]) * self.cm_per_px, float(p[1]) * self.cm_per_px)
+        s = self.last_scale if self.last_scale else self.cm_per_px
+        return (float(p[0]) * s, float(p[1]) * s)
 
     def heading_cm(self, robot_corner):
         """Robot heading in the cm frame. The marker's front direction is
@@ -324,17 +343,29 @@ class ArenaMap:
 
 # =========================================================== navigation
 class Navigator:
-    """The decision box: turn in place -> drive straight -> stop.
-    Pure logic, no camera/UI - kept testable on its own."""
+    """The decision box. Pure logic, no camera/UI - kept testable on its own.
+
+    Anti-zigzag design (replaces the old bang-bang turn-or-drive):
+      1. HYSTERESIS - turn until |err| <= aim_in (~12 deg), then commit to
+         driving and don't re-turn until |err| >= angle_tol (~25 deg). The
+         gap kills boundary chatter.
+      2. PROPORTIONAL TURN SPEED - far off course: brisk. Near aim: gentle.
+         Overshoot past zero was the main zigzag source at a fixed speed.
+      3. PULSE-STEERING while driving - inside the hysteresis band the robot
+         gets short turn pulses between straight ticks (like a servo), so it
+         curves gently toward the line instead of slam-turn/overshoot.
+    """
 
     HOLD_FRAMES = 3      # repeat last command this long when a marker drops
     RESUME_CM = 5.0      # arrived unlatches when the card moves this far out
+    PULSE_EVERY = 4      # while drift-steering: 1 turn tick per 4 ticks
+    YAW_SMOOTH = 7       # heading is the jitteriest number - smooth hard
 
     def __init__(self):
-        self.speed = 400            # 0..1023, the ONE constant speed
-        self.angle_tol = 20.0       # deg - within this, drive straight
+        self.speed = 400            # 0..1023, drive speed (slider)
+        self.angle_tol = 25.0       # deg - DRIVING re-turns only above this
         self.stop_tol = 10.0        # cm - within this, arrived
-        self.turn_invert = False    # flip if the robot turns AWAY from the card
+        self.turn_invert = False    # flip turn direction if it turns AWAY
         self.heading_offset = 0.0   # deg - fixes a marker taped slightly off
         self.reset()
 
@@ -342,9 +373,16 @@ class Navigator:
         self.state = "IDLE"         # IDLE / TURNING / DRIVING / ARRIVED / LOST
         self.last_cmd = "S"
         self.miss = 0
-        self.yaw_hist = deque(maxlen=5)   # yaw smoothing (heading is jittery)
+        self.yaw_hist = deque(maxlen=self.YAW_SMOOTH)
         self.err_deg = 0.0
         self.dist_cm = 0.0
+        self._pulse = 0
+        self._last_v = None
+
+    # ---- helpers ----
+    def aim_in(self):
+        """Inside this we consider the aim good (stop turning / go straight)."""
+        return max(6.0, 0.55 * self.angle_tol)
 
     def _smooth_heading(self, heading):
         self.yaw_hist.append(math.radians(heading))
@@ -352,17 +390,32 @@ class Navigator:
         ys = [math.sin(a) for a in self.yaw_hist]
         return math.degrees(math.atan2(sum(ys), sum(xs)))
 
+    def _turn_cmd(self, err):
+        c = "R" if err > 0 else "L"
+        if self.turn_invert:
+            c = "L" if c == "R" else "R"
+        return c
+
+    def _turn_speed(self, err):
+        """Proportional: 25% of drive speed at the aim edge, 100% at 90 deg."""
+        frac = min(1.0, abs(err) / 90.0)
+        v = int(0.25 * self.speed + frac * 0.75 * self.speed)
+        return max(150, min(1023, v))
+
+    # ---- the decision ----
     def step(self, seen_robot, seen_target, robot_cm, heading_deg, target_cm):
-        """One decision. Returns the command char to send."""
+        """One decision per frame. Returns (cmd, speed) - speed is the PWM
+        value the robot should use right now (app sends V only on change)."""
+
         # ---- marker dropout: hold briefly, then fail safe ----
         if not (seen_robot and seen_target):
             self.miss += 1
             if self.miss > self.HOLD_FRAMES:
                 self.state = "LOST"
                 self.last_cmd = "S"
-            return self.last_cmd          # hold within the grace window
-
+            return self.last_cmd, self.speed
         self.miss = 0
+
         dx = target_cm[0] - robot_cm[0]
         dy = target_cm[1] - robot_cm[1]
         self.dist_cm = math.hypot(dx, dy)
@@ -373,26 +426,39 @@ class Navigator:
         # ---- arrived: latch until the card is moved again ----
         if self.state == "ARRIVED":
             if self.dist_cm > self.stop_tol + self.RESUME_CM:
-                self.state = "TURNING"    # card moved - re-aim
+                self.state = "IDLE"             # card moved - re-aim
             else:
                 self.last_cmd = "S"
-                return self.last_cmd
-        elif self.dist_cm <= self.stop_tol:
+                return "S", self.speed
+
+        if self.dist_cm <= self.stop_tol:
             self.state = "ARRIVED"
             self.last_cmd = "S"
-            return self.last_cmd
+            return "S", self.speed
 
-        # ---- turn or drive ----
-        if abs(self.err_deg) > self.angle_tol:
-            cmd = "R" if self.err_deg > 0 else "L"
-            if self.turn_invert:
-                cmd = "L" if cmd == "R" else "R"
+        # ---- phase transitions (hysteresis band: aim_in .. angle_tol) ----
+        a = abs(self.err_deg)
+        if self.state != "TURNING" and a >= self.angle_tol:
             self.state = "TURNING"
-        else:
-            cmd = "F"
+            self._pulse = 0
+        elif self.state == "TURNING" and a <= self.aim_in():
+            self.state = "DRIVING"              # aim good - commit to driving
+            self._pulse = 0
+
+        # ---- act ----
+        if self.state == "TURNING":
+            self.last_cmd = self._turn_cmd(self.err_deg)
+            return self.last_cmd, self._turn_speed(self.err_deg)
+
+        # DRIVING (straight, with gentle pulse-steering inside the band)
+        self._pulse += 1
+        if self.aim_in() < a < self.angle_tol and self._pulse % self.PULSE_EVERY == 0:
+            self.last_cmd = self._turn_cmd(self.err_deg)      # one nudge tick
+            return self.last_cmd, self._turn_speed(self.err_deg)
+        if self.state == "IDLE":
             self.state = "DRIVING"
-        self.last_cmd = cmd
-        return cmd
+        self.last_cmd = "F"
+        return "F", self.speed
 
 
 # =========================================================== overlay
@@ -454,6 +520,7 @@ class VisionBotApp(ctk.CTk):
         self.photo = None
         self.fps, self.t_prev = 0.0, time.monotonic()
         self.last_send = 0.0
+        self._v_sent = None         # last speed value pushed to the robot
 
         self._build_ui()
         self.protocol("WM_DELETE_WINDOW", self._shutdown)
@@ -518,10 +585,10 @@ class VisionBotApp(ctk.CTk):
         self.angle_lab = row_label(panel, "Angle tolerance", r)
         self.angle = ctk.CTkSlider(panel, from_=10, to=45, number_of_steps=7,
                                    command=self._angle_changed)
-        self.angle.set(20)
+        self.angle.set(25)
         self.angle.grid(row=r + 1, column=0, columnspan=2, sticky="ew",
                         padx=12, pady=(0, 8))
-        self.angle_lab.configure(text="20 deg")
+        self.angle_lab.configure(text="25 deg")
         r += 2
         self.stoptol_lab = row_label(panel, "Stop tolerance", r)
         self.stoptol = ctk.CTkSlider(panel, from_=5, to=20, number_of_steps=15,
@@ -547,8 +614,7 @@ class VisionBotApp(ctk.CTk):
             return var
 
         self.e_head = entry_row("Heading offset (deg)", "0", r); r += 1
-        self.e_w = entry_row("Arena width (cm)", "100", r); r += 1
-        self.e_h = entry_row("Arena height (cm)", "70", r); r += 1
+        self.e_csize = entry_row("Corner marker (cm)", "6", r); r += 1
         self.e_scale = entry_row("cm/px (no corners)", "0.05", r); r += 1
         self.e_cam = entry_row("Camera (empty=auto)", "", r); r += 1
         self.e_ip = entry_row("Robot IP", ROBOT_IP, r); r += 1
@@ -576,7 +642,7 @@ class VisionBotApp(ctk.CTk):
         self.nav.stop_tol = float(self.stoptol.get())
         self.nav.turn_invert = bool(self.invert.get())
         self.nav.heading_offset = self._f(self.e_head, 0.0)
-        self.arena.configure(self._f(self.e_w, 100.0), self._f(self.e_h, 70.0),
+        self.arena.configure(self._f(self.e_csize, 6.0),
                              self._f(self.e_scale, 0.05))
 
     def _speed_changed(self, value):
@@ -585,6 +651,7 @@ class VisionBotApp(ctk.CTk):
         self.nav.speed = pct * 1023 // 100
         if self.armed and self.link:
             self.link.send_speed(self.nav.speed)
+            self._v_sent = self.nav.speed
 
     def _angle_changed(self, value):
         self.angle_lab.configure(text=f"{int(value)} deg")
@@ -596,8 +663,7 @@ class VisionBotApp(ctk.CTk):
 
     # ------------------------------------------------ control actions
     def _start(self):
-        if isinstance(self.focus_get(), type(self.e_w)) or \
-                getattr(self.focus_get(), "widgetName", "") == "entry":
+        if getattr(self.focus_get(), "widgetName", "") == "entry":
             return                                   # typing - don't hijack
         self._nav_params_changed()
         ip = self.e_ip.get().strip() or ROBOT_IP
@@ -605,6 +671,7 @@ class VisionBotApp(ctk.CTk):
             self.link = RobotLink(ip, ROBOT_PORT)
         self.nav.reset()
         self.armed = True
+        self._v_sent = self.nav.speed
         self.link.send_speed(self.nav.speed)
         print(f"[nav] START - target {ip}:{ROBOT_PORT}, "
               f"speed {self.nav.speed}/1023")
@@ -700,7 +767,7 @@ class VisionBotApp(ctk.CTk):
         now = time.monotonic()
         self.fps = 0.9 * self.fps + 0.1 / max(now - self.t_prev, 1e-6)
         self.t_prev = now
-        cmd = None
+        cmd, v = None, None
 
         if self.feed is not None:
             for ev in self.feed.poll():
@@ -720,17 +787,21 @@ class VisionBotApp(ctk.CTk):
                     target_cm = self.arena.to_cm(center_of(found[TARGET_ID]))
 
                 if self.armed:
-                    cmd = self.nav.step(seen_r, seen_t, robot_cm, heading,
-                                        target_cm)
+                    cmd, v = self.nav.step(seen_r, seen_t, robot_cm, heading,
+                                           target_cm)
 
                 draw_overlay(frame, found, self.arena, self.nav)
                 self._show(frame)
 
         self._update_readout(cmd)
-        # send at SEND_HZ while armed (the keepalive feeds the robot deadman)
+        # send at SEND_HZ while armed (the keepalive feeds the robot deadman);
+        # V goes out only when the desired speed actually changes
         if self.armed and self.link and cmd is not None and \
                 now - self.last_send >= 1.0 / SEND_HZ:
             self.link.send(cmd)
+            if v is not None and v != self._v_sent:
+                self.link.send_speed(v)
+                self._v_sent = v
             self.last_send = now
 
         self.after(30, self._tick)
@@ -760,12 +831,18 @@ class VisionBotApp(ctk.CTk):
                     "LOST": "MARKER LOST - stopped (waiting to see both)"}.get(st, st)
             self.banner.configure(text=text, text_color=color)
 
-        mode = {"corners": "corner markers (live)",
-                "cached": "corner markers (cached)",
-                "scale": "RULER SCALE (no corners seen)"}
+        if self.arena.mode == "corners":
+            arena_txt = (f"corners (live)  W{self.arena.width_cm:.0f} x "
+                         f"H{self.arena.height_cm:.0f} cm derived")
+        elif self.arena.mode == "cached":
+            arena_txt = "corners (cached homography)"
+        elif self.arena.last_scale:
+            arena_txt = "marker-derived scale (cached)"
+        else:
+            arena_txt = "RULER SCALE (no corners seen)"
         lines = [
             f"state   : {st:<8} cmd {cmd or '-'}   speed {int(self.speed.get())}%",
-            f"arena   : {mode[self.arena.mode]}",
+            f"arena   : {arena_txt}",
             f"dist    : {self.nav.dist_cm:6.1f} cm   err {self.nav.err_deg:+6.1f} deg",
             f"tol     : {self.nav.angle_tol:.0f} deg / {self.nav.stop_tol:.0f} cm"
             f"   turn invert {'ON' if self.nav.turn_invert else 'off'}",
