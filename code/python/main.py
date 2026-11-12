@@ -356,10 +356,9 @@ class Navigator:
       1. HYSTERESIS - turn until |err| <= aim_in (~12 deg), then commit to
          driving and don't re-turn until |err| >= angle_tol (~25 deg). The
          gap kills boundary chatter.
-      2. PROPORTIONAL TURN SPEED - far off course: 100% of the drive speed.
-         Near aim: 65%. (Never lower - below ~25% PWM these motors stall and
-         just hum.) Overshoot past zero was the main zigzag source at a
-         fixed speed.
+      2. PROPORTIONAL TURN SPEED - between a stall-safe floor (300/1023,
+         ~29%) and the drive-speed slider. Field-measured: these motors
+         stall below ~25% PWM; the floor keeps both wheels turning.
       3. PULSE-STEERING while driving - inside the hysteresis band the robot
          gets short turn pulses between straight ticks (like a servo), so it
          curves gently toward the line instead of slam-turn/overshoot.
@@ -405,13 +404,19 @@ class Navigator:
             c = "L" if c == "R" else "R"
         return c
 
+    # Motors measured in the field: below ~25% PWM they stall (hum, no
+    # motion), above ~40% the robot is too fast. So turning uses ABSOLUTE
+    # PWM bounds - never a fraction of the slider that could sink below
+    # the stall point: floor 300/1023 (~29%, safely above stall), ceiling
+    # = the drive-speed slider.
+    TURN_FLOOR_PWM = 300
+
     def _turn_speed(self, err):
-        """Proportional between 65% and 100% of drive speed. The floor is
-        high on purpose: below ~25% PWM these motors just hum (stall) - an
-        earlier 15% floor froze the robot mid-turn with one wheel stopped."""
+        """Proportional from the stall-safe floor up to the drive speed."""
         frac = min(1.0, abs(err) / 90.0)
-        v = int((0.65 + 0.35 * frac) * self.speed)
-        return max(250, min(1023, v))
+        lo = self.TURN_FLOOR_PWM
+        hi = max(lo, self.speed)
+        return int(lo + frac * (hi - lo))
 
     # ---- the decision ----
     def step(self, seen_robot, seen_target, robot_cm, heading_deg, target_cm):
@@ -586,12 +591,12 @@ class VisionBotApp(ctk.CTk):
                             padx=12, pady=(4, 10))
         r += 1
         self.speed_lab = row_label(panel, "Speed (constant)", r)
-        self.speed = ctk.CTkSlider(panel, from_=10, to=100, number_of_steps=18,
+        self.speed = ctk.CTkSlider(panel, from_=25, to=100, number_of_steps=15,
                                    command=self._speed_changed)
-        self.speed.set(40)
+        self.speed.set(35)
         self.speed.grid(row=r + 1, column=0, columnspan=2, sticky="ew",
                         padx=12, pady=(0, 8))
-        self.speed_lab.configure(text="40%")
+        self.speed_lab.configure(text="35%")
         r += 2
         self.angle_lab = row_label(panel, "Angle tolerance", r)
         self.angle = ctk.CTkSlider(panel, from_=10, to=45, number_of_steps=7,
