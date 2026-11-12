@@ -419,3 +419,22 @@ User report after C920 replug: **"works perfect!"** — live video in the native
 **Test lessons (ours, not the app's):** a spawned-process test MUST run under an `if __name__ == "__main__"` guard (else children re-run the test file); and a `maxsize=2` mp.Queue with 3 puts and **no consumer deadlocks** — both cost a debugging round.
 
 **User action if it ever says "Camera stuck (driver)":** unplug/replug the C920, click Start/Stop camera again. That message is the app catching a wedged driver safely instead of freezing.
+
+---
+
+## 2026-11-13 — Branch `nav-autoscale-control`: marker-derived scale + anti-zigzag control
+
+**User observations that drove this (first closed-loop run):** robot kept rotating without settling; didn't re-follow the card when moved; straight-line test degraded over time; `err` often parked near **+79°** (diagnosis: marker plate rotated/slipped on the robot — nose and marker-front must agree, see Heading offset). And two requests: derive the arena size automatically (typing cm "wont work"), fix the erratic heading/zigzag when the target is at an angle.
+
+**Change 1 — cm scale derived from the markers themselves:** each corner marker's printed size is known (6 cm), the detector gives its quad in pixels → cm/px = 6 ÷ mean side. 4 markers × 4 sides = 16 samples averaged per frame; arena W/H fall out of the taped marker positions × scale. Typed arena-size entries REMOVED; only "Corner marker (cm)" (default 6) remains. Verified: derived W=70.6 / H=36.3 cm vs ground truth 70.0 / 36.0 (<1%); positions match truth to <1.5 cm; corner-loss → cached homography keeps cm identical; never-seen-corners → typed ruler scale.
+
+**Change 2 — anti-zigzag navigation** (old: bang-bang full-speed turn vs straight-only, no mid-drive correction → overshoot oscillation):
+1. **Proportional turn speed** — far off course: full speed; near aim: 25% floor (V commands, sent only on change).
+2. **Hysteresis** — commit to DRIVING at |err| ≤ 0.55×tol, re-turn only at |err| ≥ tol → no boundary chatter.
+3. **Pulse-steering while driving** — inside the band, 1 gentle turn nudge per 4 ticks (verified pattern `FFFRFFFRFFFR`) → curved corrections instead of slam-turns.
+4. Yaw smoothing deepened (7 frames).
+Regressions re-verified: arrived latch/resume, hold-3-frames-then-stop, invert + heading-offset behavior.
+
+**Verification:** 8 headless checks on synthetic 6-marker frames — auto-scale accuracy, heading exactness, proportional speeds (400 vs 191), hysteresis sequence (turn at 90/40/20 → commit at 10 → hold at 20 → re-turn at 30), pulse pattern, latches, fallbacks, GUI smoke with the new entry. Committed as `cbea732` on branch `nav-autoscale-control` (main untouched for easy A/B).
+
+**Live test on the branch:** same three-step ladder (straight 30 cm → card behind → 5 spots). Expect: TURNING slows down as it closes on the line, one committed straight run with gentle nudges, ARRIVED. Speed slider = drive speed; turn speed is automatic.
