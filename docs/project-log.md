@@ -377,3 +377,45 @@ User report after C920 replug: **"works perfect!"** — live video in the native
 **Live checklist for the first run:** ① rig camera + tape corners, robot+card in view ② check "corners (live)" in the readout ③ press START: if the robot turns AWAY from the card, tick "Invert turn direction" ④ adjust speed slider live. Full rig acceptance test = the 2-minute corner walk from the placement rules.
 
 **Next:** live closed-loop run on the real arena (Block 5 checkpoint: card reached 5× in a row), then Block 6 safety demos (cover camera → stop; Wi-Fi off → deadman) and rehearsal.
+
+---
+
+## 2026-11-13 — main.py camera fix: window froze on Start/Stop camera
+
+**What broke:** clicking Start/Stop camera ran `open_camera_auto()` — up to 3 camera opens back-to-back **on the UI thread** (each blocks 1–3 s). The Tk event loop stalled, Windows flagged the window "Not Responding" after ~5 s. If the app was then force-killed mid-open, the C920 driver can wedge (known failure from the detect_ui saga — every later open hangs until the camera is unplugged/replugged).
+
+**Fix:** the camera open is now a **state machine that opens ONE index per UI tick** ("opening"/"on"/"off"): the banner paints "Opening camera N… (a few seconds)" *before* the blocking call (`update_idletasks`), the queue advances one index per 30 ms tick, so the window stays alive between tries. C920 (1080p) adopted the moment it's found; first working non-1080p kept as fallback and **released when a better one is adopted** (the tests caught a leak: the backup camera stayed open); all-fail → clean "No camera found — click to retry". Stop during opening releases the pending fallback. Same DSHOW/V4L2, main-thread pattern as the rest of the project.
+
+**Verification (fake-camera state machine, no hardware touched):** A) idx0 fails / idx1 720p / idx2 1080p → 1080p adopted on tick 3, 720p released; B) only 720p exists → fallback adopted, not released-then-adopted; C) nothing opens → state off + retry banner; D) Stop mid-probe releases the fallback. GUI smoke-clean shutdown.
+
+**Field note for demo day:** if the camera ever "won't open" or hangs at opening — close every camera program first, and if it persists >15 s: **unplug/replug the C920** (driver wedge). Always quit camera apps with their own button/q/ESC, never by killing the process.
+
+**Next:** unchanged — live closed-loop run (Block 5), safety demos, rehearsal.
+
+---
+
+## 2026-11-13 — Demo rule: main.py uses the C920 only, never the integrated camera
+
+**Change:** the auto-probe no longer keeps a non-1080p camera as fallback. A camera that opens but isn't 1080p is **released immediately and skipped** (console: "not the C920, skipped"); if no 1080p camera is found the app refuses with **"No 1080p camera found — connect the Logitech C920, then click Start/Stop camera"** instead of silently substituting the built-in webcam. A forced camera index is held to the same rule. Rationale: a wrong-camera feed at the venue (markers invisible, everything looks broken) is worse than a loud "connect the C920".
+
+**Verification (fake cameras):** 720p@0 + C920@1 → 720p skipped/released, C920 adopted; integrated-only → refused cleanly, nothing left open; forced index of a 720p camera → refused too.
+
+**Note:** `detect_test.py` / `detect_ui.py` (dev tools) still fall back to the first working camera — fine for the bench; tell us if you want them strict too.
+
+---
+
+## 2026-11-13 — main.py camera fix, round 2: helper PROCESS (the real freeze fix)
+
+**What broke:** even with one-open-per-tick, clicking Start/Stop camera froze the window again. Root cause: a **single** `cv2.VideoCapture.open()` can block FOREVER on a wedged driver — the timeout properties never fire (known from the v3.1 saga) — and then the UI thread is stuck *inside* the call; no tick-chunking can help. The earlier force-kills had likely left the C920 driver wedged, guaranteeing the hang.
+
+**Fix (architectural):** all camera work moved into a **helper process** (`camera_worker` + `CameraFeed`):
+- The UI thread only drains queues and decodes JPEGs — nothing it calls can block on the camera. Ever.
+- Helper opens/probes (C920-only rule kept), reads frames, ships them as JPEGs over a queue (drop-oldest at depth 2).
+- **Watchdog:** no helper news for 15 s while opening → helper killed, banner: *"Camera stuck (driver) — UNPLUG and REPLUG the C920, then click Start/Stop camera"*. Helper respawns on the next click.
+- Stop/shutdown: graceful quit (lets the helper `release()` the camera) with terminate as fallback — and the UI stays alive either way.
+
+**Verification (4 staged checks, hard timeouts, real spawn):** watchdog fires on silence/quiet while talking; newest-JPEG decode + full queue drain; **real spawned helper** → `('opening',9)`, `('fail',)` in ~2 s, shutdown 0.1 s; **full GUI** → toggle → fail → "No 1080p camera found", `app.update()` pumping throughout, clean shutdown.
+
+**Test lessons (ours, not the app's):** a spawned-process test MUST run under an `if __name__ == "__main__"` guard (else children re-run the test file); and a `maxsize=2` mp.Queue with 3 puts and **no consumer deadlocks** — both cost a debugging round.
+
+**User action if it ever says "Camera stuck (driver)":** unplug/replug the C920, click Start/Stop camera again. That message is the app catching a wedged driver safely instead of freezing.

@@ -18,8 +18,13 @@ Behaviour (deliberately simple - docs/plan-2day-build.md):
   stop tolerance. Marker lost -> hold ~3 frames -> STOP. Arrived -> latch until
   the card moves again. Radio silent -> the robot's own deadman stops it (0.6 s).
 
-Camera rule on this project: main-thread only, DSHOW (Windows) / V4L2 (Ubuntu),
-auto-detect the 1080p C920 - same proven pattern as detect_test.py.
+Camera rule on this project (learned the hard way): the UI thread must NEVER
+call cv2.VideoCapture - a single open() can hang FOREVER on a wedged driver
+(the timeout props don't fire), and Windows then flags the window "not
+responding". So all camera work happens in a separate HELPER PROCESS that
+ships JPEG frames over a queue; a hang there is caught by a watchdog in the
+UI, the helper gets killed and can respawn. Only the 1080p C920 is ever used
+(demo rule - the integrated webcam is skipped, never substituted).
 
 Run:  .venv\\Scripts\\python main.py        (Windows)
       .venv/bin/python main.py             (Ubuntu demo box)
@@ -27,6 +32,7 @@ Robot Wi-Fi "VisionBot" joined first, robot powered, camera rig up.
 """
 
 import math
+import multiprocessing as mp
 import os
 import socket
 import sys
@@ -38,8 +44,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from detect_test import (ArucoDetector, center_of, yaw_deg,
-                         open_camera_once, open_camera_auto, drain_read,
-                         ROBOT_ID, TARGET_ID, SNAPSHOT_DIR)
+                         open_camera_once, ROBOT_ID, TARGET_ID, SNAPSHOT_DIR)
 
 import customtkinter as ctk
 from PIL import Image, ImageTk
@@ -90,6 +95,163 @@ class RobotLink:
 
     def close(self):
         self.sock.close()
+
+
+# =========================================================== camera feed
+def camera_worker(cmd_q, evt_q, frame_q):
+    """HELPER PROCESS - the only place cv2.VideoCapture is ever touched.
+
+    Runs in its own process on purpose: an open() on a wedged driver can
+    block FOREVER (proven on this project), and then it only takes down
+    this helper - the UI keeps running, shows a watchdog message, and can
+    kill + respawn us. Commands: ('open', [indices]) / ('close',) /
+    ('quit',). Events out: ('opening',i) ('skip',i,w) ('ok',i,w,h)
+    ('fail',) ('closed',) ('frameerr',). Frames out: JPEG bytes.
+    """
+    cap = None
+    while True:
+        cmd = None
+        try:
+            cmd = cmd_q.get_nowait()
+        except Exception:
+            pass
+
+        if cmd is not None:
+            kind = cmd[0]
+            if kind == "open":
+                if cap is not None:
+                    cap.release()
+                    cap = None
+                for idx in cmd[1]:
+                    evt_q.put(("opening", idx))
+                    cap = open_camera_once(idx)          # may block forever - fine here
+                    if cap is not None:
+                        w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                        if w >= 1920:                    # the C920
+                            h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                            evt_q.put(("ok", idx, w, h))
+                            break
+                        cap.release()                    # not 1080p - skip it
+                        evt_q.put(("skip", idx, w))
+                if cap is None:
+                    evt_q.put(("fail",))
+            elif kind == "close":
+                if cap is not None:
+                    cap.release()
+                    cap = None
+                evt_q.put(("closed",))
+            elif kind == "quit":
+                break
+
+        if cap is None:
+            if cmd is None:
+                time.sleep(0.02)                         # idle - nothing to do
+            continue
+
+        ok, frame = cap.read()
+        if ok:
+            ok2, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+            if ok2:
+                data = buf.tobytes()
+                try:
+                    frame_q.put_nowait(data)
+                except Exception:                        # queue full -> drop oldest
+                    try:
+                        frame_q.get_nowait()
+                        frame_q.put_nowait(data)
+                    except Exception:
+                        pass
+        else:
+            evt_q.put(("frameerr",))                     # stream stalled
+            time.sleep(0.1)
+
+    if cap is not None:
+        cap.release()
+
+
+class CameraFeed:
+    """UI-side handle for the camera helper process.
+
+    The UI thread only ever drains queues and decodes JPEGs - nothing here
+    can block, so the window can no longer freeze on camera problems.
+    """
+
+    OPEN_STUCK_S = 15.0    # no news from the helper while opening = wedged
+
+    def __init__(self):
+        self._mp = mp.get_context("spawn")
+        self.proc = None
+        self.cmd_q = self.evt_q = self.frame_q = None
+        self.opening = False
+        self.last_msg = 0.0
+
+    def _ensure_worker(self):
+        if self.proc is not None and self.proc.is_alive():
+            return
+        self.cmd_q = self._mp.Queue()
+        self.evt_q = self._mp.Queue()
+        self.frame_q = self._mp.Queue(maxsize=2)
+        self.proc = self._mp.Process(target=camera_worker,
+                                     args=(self.cmd_q, self.evt_q, self.frame_q),
+                                     daemon=True)
+        self.proc.start()
+
+    def start_open(self, indices):
+        self._ensure_worker()
+        self.opening = True
+        self.last_msg = time.monotonic()
+        self.cmd_q.put(("open", list(indices)))
+
+    def poll(self):
+        """Drain status events; adds ('stuck',)/('dead',) verdicts."""
+        events = []
+        if self.proc is None:
+            return events
+        while True:
+            try:
+                ev = self.evt_q.get_nowait()
+            except Exception:
+                break
+            self.last_msg = time.monotonic()
+            if ev[0] in ("ok", "fail"):
+                self.opening = False
+            events.append(ev)
+        if self.opening:
+            if time.monotonic() - self.last_msg > self.OPEN_STUCK_S:
+                events.append(("stuck",))
+                self.opening = False
+            elif not self.proc.is_alive():
+                events.append(("dead", self.proc.exitcode))
+                self.opening = False
+        return events
+
+    def latest_frame(self):
+        """Newest JPEG from the helper, decoded. None if nothing new."""
+        data = None
+        while True:
+            try:
+                data = self.frame_q.get_nowait()
+            except Exception:
+                break
+        if data is None:
+            return None
+        return cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
+
+    def shutdown(self):
+        """Stop the camera and end the helper. Safe to call anytime."""
+        self.opening = False
+        if self.proc is None:
+            return
+        if self.proc.is_alive():
+            try:
+                self.cmd_q.put(("quit",))
+            except Exception:
+                pass
+            self.proc.join(timeout=1.5)      # let it release() the camera
+        if self.proc.is_alive():
+            self.proc.terminate()            # wedged helper - force it
+            self.proc.join(timeout=2.0)
+        self.proc = None
 
 
 # =========================================================== arena mapping
@@ -286,7 +448,8 @@ class VisionBotApp(ctk.CTk):
         self.nav = Navigator()
         self.link = None            # created on START
         self.armed = False
-        self.cap = None
+        self.feed = None            # camera helper process (never None-blocking)
+        self.cam_state = "off"      # off / opening / on
         self.cam_info = "camera off"
         self.photo = None
         self.fps, self.t_prev = 0.0, time.monotonic()
@@ -471,22 +634,64 @@ class VisionBotApp(ctk.CTk):
             print(f"snapshot saved: {path}")
 
     def _toggle_camera(self):
-        if self.cap is not None:
-            self.cap.release()
-            self.cap = None
+        if self.cam_state in ("on", "opening"):
+            self.feed.shutdown()                 # graceful, force if wedged
+            self.feed = None
+            self.cam_state = "off"
             self.cam_info = "camera off"
             print("[camera] released")
             return
+        indices = [0, 1, 2]                      # C920 was index 0 last time
         idx_text = self.e_cam.get().strip()
         if idx_text:
-            self.cap = open_camera_once(int(idx_text))
-        else:
-            print("[camera] auto-detecting (looking for the 1080p webcam)...")
-            self.cap = open_camera_auto()
-        if self.cap is not None:
-            w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-            h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            self.cam_info = f"camera ({w}x{h})"
+            try:
+                indices = [int(idx_text)]
+            except ValueError:
+                pass
+        self.feed = CameraFeed()
+        self.cam_state = "opening"
+        self.banner.configure(text="Opening camera... (runs in a helper "
+                                   "process - this window stays responsive)",
+                              text_color="#e0a020")
+        print(f"[camera] opening: will try indices {indices}")
+        self.feed.start_open(indices)
+
+    def _on_cam_event(self, ev):
+        """React to one status event from the camera helper."""
+        kind = ev[0]
+        if kind == "opening":
+            self.banner.configure(text=f"Opening camera {ev[1]}... (a few seconds)",
+                                  text_color="#e0a020")
+        elif kind == "ok":
+            _, idx, w, h = ev
+            self.cam_state = "on"
+            self.cam_info = f"camera {idx} ({w}x{h})"
+            print(f"[camera] using {self.cam_info}")
+        elif kind == "skip":
+            print(f"[camera] index {ev[1]}: {ev[2]}px wide - not the C920, skipped")
+        elif kind == "fail":
+            self.cam_state = "off"
+            self.banner.configure(
+                text="No 1080p camera found - connect the Logitech C920, "
+                     "then click Start/Stop camera",
+                text_color="#d04040")
+            print("[camera] no 1080p camera found - the demo needs the C920")
+        elif kind == "stuck":
+            self.feed.shutdown()
+            self.cam_state = "off"
+            self.banner.configure(
+                text="Camera stuck (driver) - UNPLUG and REPLUG the C920, "
+                     "then click Start/Stop camera",
+                text_color="#d04040")
+            print("[camera] helper went silent - killed. Unplug/replug the C920.")
+        elif kind == "dead":
+            self.cam_state = "off"
+            self.banner.configure(
+                text="Camera helper exited unexpectedly - click Start/Stop camera",
+                text_color="#d04040")
+            print(f"[camera] helper exitcode {ev[1]}")
+        elif kind == "frameerr":
+            print("[camera] frame stalled - if this repeats, toggle the camera off/on")
 
     # ------------------------------------------------ main loop
     _last_frame = None
@@ -497,8 +702,10 @@ class VisionBotApp(ctk.CTk):
         self.t_prev = now
         cmd = None
 
-        if self.cap is not None:
-            frame = drain_read(self.cap)
+        if self.feed is not None:
+            for ev in self.feed.poll():
+                self._on_cam_event(ev)
+            frame = self.feed.latest_frame()
             if frame is not None:
                 self._last_frame = frame
                 found = self.detector.detect(frame)
@@ -539,12 +746,19 @@ class VisionBotApp(ctk.CTk):
     def _update_readout(self, cmd):
         st = self.nav.state
         color = STATE_COLORS.get(st, "#8a8a8a")
-        text = {"IDLE": "Press START (or SPACE)",
-                "TURNING": f"TURNING   err {self.nav.err_deg:+.0f} deg",
-                "DRIVING": f"DRIVING   {self.nav.dist_cm:.0f} cm to card",
-                "ARRIVED": "ARRIVED - move the card to go again",
-                "LOST": "MARKER LOST - stopped (waiting to see both)"}.get(st, st)
-        self.banner.configure(text=text, text_color=color)
+        if self.cam_state == "opening":
+            pass                                  # keep the "Opening..." banner
+        elif self.cam_state == "off":
+            self.banner.configure(
+                text="Camera off - click 'Start / Stop camera'",
+                text_color="#8a8a8a")
+        else:
+            text = {"IDLE": "Press START (or SPACE)",
+                    "TURNING": f"TURNING   err {self.nav.err_deg:+.0f} deg",
+                    "DRIVING": f"DRIVING   {self.nav.dist_cm:.0f} cm to card",
+                    "ARRIVED": "ARRIVED - move the card to go again",
+                    "LOST": "MARKER LOST - stopped (waiting to see both)"}.get(st, st)
+            self.banner.configure(text=text, text_color=color)
 
         mode = {"corners": "corner markers (live)",
                 "cached": "corner markers (cached)",
@@ -566,8 +780,9 @@ class VisionBotApp(ctk.CTk):
         if self.link:
             self.link.stop_burst()
             self.link.close()
-        if self.cap is not None:
-            self.cap.release()
+        if self.feed is not None:
+            self.feed.shutdown()
+            self.feed = None
         self.destroy()
 
 
