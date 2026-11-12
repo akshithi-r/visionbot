@@ -137,3 +137,211 @@ A perfectly-centered camera goes through the same calibration — one code path 
 **Numbers we used:** TEST_SPEED = 400/1023 ≈ 40% PWM — matches the plan's starting value.
 
 **Next:** upload via PlatformIO (→ Upload, monitor 9600), robot on a cup, run the Block 2 checklist (watch each wheel). Then Wi-Fi drive-test firmware + `drive_test.py`.
+
+---
+
+## 2026-11-13 — Block 2 motor test PASSED on hardware
+
+**What we did:** Uploaded the motor test via PlatformIO IDE and ran it on the real robot, wheels-up on a cup — family confirmed it works. STOP / FORWARD / BACKWARD / LEFT / RIGHT all observed. *(If you swapped any motor's wires to fix a backward wheel, add a line here — it's part of the story judges like.)*
+
+**Checkpoint:** Block 2 ✅ — every command moves the correct wheels.
+
+**Next:** Block 3 — the fun one: NodeMCU opens a Wi-Fi hotspot `VisionBot`, laptop joins it, and `drive_test.py` lets the kid drive with W/A/S/D.
+
+---
+
+## 2026-11-13 — detect_ui v2: smooth video + Start/Stop camera button
+
+**What we did:** First live run found two issues — the video staggered badly, and there was no way to release the camera without killing the program. Rewrote `detect_ui.py`:
+
+1. **Background camera thread** now reads the camera continuously; UI ticks just take the newest frame. (Root cause of the staggering: the old code read the camera only 7×/sec, so it kept displaying *old buffered* frames — the lag grew over time. A second process couldn't even probe the cameras while the UI held one.)
+2. **Lighter transport to the browser**: 960-px JPEG for display instead of 1920-px PNG — detection still runs at full 1080p; snapshots still save full size.
+3. **Start/Stop camera button**: releases the camera instantly so other programs can use it; Start reopens it.
+4. Readout now shows **camera fps and UI fps** separately, so video health is visible at a glance. UI refresh 10 fps.
+
+**Verification:** display correctly downscaled to 960 px while snapshot copy stays 1200 px; banner + both-fps readout OK; stop → "camera stopped" message frame + camera released; start → reopens; server launched headless and served the page.
+
+**How to run:** `python detect_ui.py --cam 1` (Logitech was index 1 on our laptop; built-in is 0).
+
+**Next:** Block 3 — Wi-Fi drive-test firmware + `drive_test.py`.
+
+---
+
+## 2026-11-13 — Design decision: markers-only navigation (arena box optional)
+
+**Question:** do we need the arena bounding box at all? Can navigation work with markers alone?
+
+**Answer/decision:** **Markers alone are enough.** The navigation loop needs exactly three things, and all come from the two markers: robot position (x, y), robot heading (from the marker's own rotation), target position (x, y). Distance + bearing error are computed in **pixel space**:
+- angles need no conversion at all (degrees are degrees),
+- the stop tolerance needs just ONE scale number (cm/px from the 30 cm ruler check in Block 4) — `tol_px = 8 cm × scale`.
+
+So `calibrate.py` (4-corner perspective calibration) drops off the critical path **for a centered overhead mount**, where perspective distortion is negligible. It comes back only if the camera must sit at an angle (then distances/angles warp across the arena and the corners fix that).
+
+Containment without a software box: "marker lost → STOP" already keeps the robot inside the camera's view — it physically cannot drive off unseen. Remaining risk is veering near a table edge *while both markers are visible* → mitigate physically: arena on the floor, or a tape/barrier boundary. The physical border still exists for visitors (where to place the card) — it just has no coordinates in software.
+
+**Demo talking point:** the robot navigates purely from what it sees — landmark-based navigation, the same idea ships and aircraft used with lighthouses and stars, and what robots do with visual landmarks.
+
+**Plan impact:** `main.py` = detection + math + UDP send, using the single scale number; no corner-clicking step. Extra time goes to tuning and rehearsal instead.
+
+---
+
+## 2026-11-13 — Arena corner markers (IDs 30-33) + height/parallax analysis
+
+**Two questions from live testing:**
+1. *Robot marker sits ~9 cm above the ground, target card lies flat — does the height difference break navigation?* → **Parallax, not a bug, but real:** an angled camera sees an elevated point shifted away from the camera vs. its ground position. Shift ≈ marker height × (distance from the point under the camera) ÷ camera height. With H=110 cm, h=9 cm: ~4 cm at 50 cm off-center, ~7 cm at 90 cm. Effect: at physical arrival the measured distance reads ~that shift instead of 0 → absorb it by mounting the marker LOW (flat plate, ~6-7 cm), camera high, stop tolerance 10 cm, card 12 cm wide. (Perfect fix, not needed for the demo: second calibration plane at robot-marker height.)
+2. *Camera is always angled in practice — add corner markers?* → **Yes.** Four 6 cm corner markers give an automatic perspective correction (homography): card position exact in cm, uniform scale, and it **self-recalibrates every frame** — camera bumped at the venue = no problem, no clicking. Ground-plane corners do NOT remove the robot-marker height parallax (height effect ≠ perspective effect); low mounting + tolerance covers that.
+
+**What we did:** extended `generate_markers.py` — `print_a4_markers.pdf` now has **page 3: the four corner markers** (IDs 30/31/32/33, ~6 cm, labeled TOP-LEFT / TOP-RIGHT / BOTTOM-RIGHT / BOTTOM-LEFT *as the camera sees the picture*). Different IDs so they can never be confused with robot 10 / target 20.
+
+**Verification:** corner page detects exactly [30,31,32,33]; PDF has 3 pages; a synthetic frame with ALL SIX markers detects all of them together — the nav code just ignores IDs it doesn't listen to.
+
+**Taping note:** print page 3 at 100%, cut on gray lines, tape flat inside the four arena corners. On-screen check: a robot standing near ID 30 must appear top-left of the picture. If corners end up swapped, the robot drives mirrored → re-tape.
+
+**Plan impact:** `main.py` uses the 4 corners for perspective + cm whenever all four are visible (last-good cached if the robot briefly covers one), and falls back to the single ruler scale if no corners are taped.
+
+---
+
+## 2026-11-13 — Calibration decision + camera placement rules
+
+**Decision: self-healing corner markers** (option C from the calibration discussion: baked-in numbers / one-time setup ritual / taped corners). Chosen because it's the only option whose failure mode is *none* — the correction recomputes every frame, so a bumped camera at the venue heals itself invisibly. Fallback chain stays: no corners visible → single scale; sanity habit: park robot in the START box, on-screen cm must read ~(10, 10) ± 2 cm.
+
+**Camera placement rules (for the ~100×70 arena, C920):**
+1. **50° rule (detection):** worst-case viewing angle at the FAR corner ≤ ~50°, comfortable ≤ 45°. Formula: **camera height ≥ horizontal distance to farthest corner ÷ 1.2** (tan 50° ≈ 1.2).
+2. **The sneaky one — horizontal FOV (~70°):** an edge-mounted camera can't see its own NEAR corners (they sit >35° off to the sides). No height fixes this; only pulling the camera ~50 cm back from the edge does — which then forces ~130 cm height. Edge mounts are tall and fussy.
+3. **Best mount: overhead plank bridge** (two chair/book stacks + plank, camera pointing down) at **110–130 cm** — everything lands ≤ ~35°, parallax shrinks (error ∝ 1/height), whole arena in frame with margin. Higher keeps helping up to ~150 cm; pixel size is not the limit.
+4. **2-minute acceptance test (at home AND at the venue):** with the detect UI open — target card placed at each corner + center (5 spots, all badges green), all four corner markers 30–33 visible at once, card slid along the far edge with no amber flicker. Failing far corner → raise camera / move toward center.
+
+**Bonus:** overhead mount fixes two problems at once — detection angle AND the robot-marker parallax from the previous entry.
+
+---
+
+## 2026-11-13 — Loop-robustness analysis (can detection + navigation run continuously?)
+
+**Question:** can the program detect all markers continuously *and* steer the robot at the same time, flawlessly?
+
+**Answer:** not flawlessly — **and it doesn't need to be.** The closed loop is error-tolerant by design. Numbers: detect 6 markers ≈ 5–15 ms per 1080p frame (camera gives a new frame every ~33 ms); decide + UDP send < 2 ms; total loop latency ~50–80 ms. Robot at ~40% PWM moves ~1 cm per frame, ~2 cm per loop latency → absorbed by the 10 cm tolerance. The loop is a fast sequential pipeline (detect → decide → send, 10–30×/s), not literally simultaneous — effectively continuous to the robot.
+
+**Expected dropout behavior (all fail SAFE):** blurred robot marker during fast turns (realistic detection rate 90–98% of frames while moving) → hold-then-stop → reacquire when nearly still; card hidden under the parked robot → success already latched; corner briefly covered → cached correction; camera bumped → self-heals next frame; Wi-Fi/laptop failure → ESP deadman stops motors in 0.6 s.
+
+**Two rules to bake into `main.py`:**
+1. **Hold-then-stop:** on a missed frame, repeat the previous command for up to ~3 frames (~100 ms), then STOP — prevents stutter on single dropped frames.
+2. **Yaw smoothing** (average last few readings): heading is the jitteriest measurement; smoothing visibly straightens driving.
+
+**Field fix if blur appears at the venue:** lock the C920 exposure (Logitech/Camera settings) so the shutter stays fast in dim light.
+
+**Demo feature:** cover the camera on purpose → robot stops instantly → "it never acts on stale information; if it can't see, it stops — failing safe, like real autonomous vehicles."
+
+---
+
+## 2026-11-13 — Table-demo camera height (arena on a 2.5 ft table)
+
+**Question:** camera 3 ft above the table surface?
+
+**Answer: 4 ft (≈120 cm) above the table, not 3 ft.** Coverage math (C920 straight down, 100×70 arena): at 91 cm the 70 cm direction has only ~1 cm total slack (2·H·tan21.5° ≈ 72 cm) — one bump and a corner marker exits the frame. At 120 cm: 95 cm coverage (12 cm/side margin), far-corner viewing angle 27°, worst-case parallax ≈ 4.6 cm (9 × 61/120). Acceptable minimum 105 cm; recommended 120–130 cm. Total camera height from floor ≈ 2 m.
+
+**Rig notes:** plank bridge on stacks ON the table; C920 (~140 g) taped at plank midpoint, USB cable zip-tied; **add a USB extension (1.8–3 m) to the kit** (C920 cable is only ~1.5 m). Weight the stack bases; setup at ~2 m is an adult job. Run the 2-minute corner walk after rigging — at home today AND at the venue.
+
+---
+
+## 2026-11-13 — detect_ui v3: auto camera detect + plain-text buttons (corrects v2's "--cam 1" note)
+
+**What broke / how we fixed it:**
+1. Start/Stop button showed raw HTML entities ("&#9209; Stop camera") — Gradio buttons don't render entities → plain-text labels now.
+2. "No camera feed" with v2: camera opens from a **background thread hang on Windows** (COM not initialised there — proven with a minimal test: worker thread never returns, main-thread opens work). v2's capture thread was the culprit → removed; all camera opens/reads/releases now happen inside the UI tick (Gradio event threads, proven in live use since v1).
+3. Freshness without a thread: each tick **drains the camera buffer** (`grab()` ×4 then `retrieve()`) — displayed frames are never stale, keeping v2's smoothness fix.
+4. Camera index numbering is **unstable** (C920 enumerated as 0 today, and differently per backend — v2's "--cam 1" note above was wrong). New **auto mode is the default**: probes cameras one per tick, picks the one reporting 1920×1080 (our C920 — the only 1080p camera), falls back to first working, holds "no camera found" with a retry pause.
+
+**Verification:** auto prefers a 1080p fake over a 720p one; fallback path works; no-camera message holds; **real** end-to-end auto-detect opened camera 0 (1920×1080); Stop releases the camera; server launches headless and serves the page.
+
+**How to run now:** `python detect_ui.py` — no `--cam` needed. The readout shows which camera auto picked (e.g. "camera 0 (1920x1080)").
+
+---
+
+## 2026-11-13 — detect_ui v3.1: the real camera fix — DirectShow only
+
+**What broke:** v3 still showed no feed on the kid's run. Decisive experiment: ran camera opens on a `ThreadPoolExecutor` (the same kind of worker threads Gradio uses for ticks) → **MSMF backend HANGS there** (no result in 12 s, process barely exits; COM not initialised on those threads — even open-timeouts never fire), while **DSHOW opens and reads fine**. v1 (which worked live) was DSHOW-first; v3 had switched to MSMF-first — that single line froze the very first tick.
+
+**Fix:** `_open_once` is now **DirectShow-only** (timeouts kept, MSMF fallback deliberately NOT added — a clean "cannot open" message beats a frozen UI). Console now prints each open attempt (`[camera] index N: DSHOW ok / cannot open`) for live diagnosis.
+
+**Verification:** full tick path with real DSHOW opens executed on pool workers (Gradio's execution model): tick 1 → `opened camera 0 (1920x1080)`, status running, 960-px display frame; Stop button releases cleanly from a worker. All state-machine tests re-passed.
+
+**Rule for the rest of the project:** on this laptop, OpenCV camera = `cv2.VideoCapture(idx, cv2.CAP_DSHOW)`, opened/used from Gradio event threads only, never from our own background threads.
+
+---
+
+## 2026-11-13 — Final demo runs on Ubuntu → camera code made platform-aware
+
+**What we learned:** the exhibition machine is **Ubuntu** (Windows laptop is dev-only). DirectShow is Windows-only, so v3.1 as written would have found no camera on the demo machine. `detect_ui.py` and `detect_test.py` now pick the backend per OS: `CAP_DSHOW` on Windows (proven in Gradio threads here), `CAP_V4L2` on Linux (native, no COM quirks; the timeout props are Windows-only and ignored harmlessly).
+
+**New doc:** [ubuntu-setup.md](ubuntu-setup.md) — one-time apt installs (`python3-venv libgl1` — without libgl1, `import cv2` fails with `ImportError: libGL.so.1`), venv/pip setup, camera check with `v4l2-ctl` (C920 shows two /dev/video nodes — video + metadata; the auto-detect's no-frame check skips the metadata node), `video`/`dialout` group fixes, focus lock via `v4l2-ctl`, and the rule: **run the 2-minute acceptance test on the Ubuntu box with the full rig, not on the Windows laptop.**
+
+**Verification:** both files compile clean; fake-based auto-detect state machine still passes with the platform-aware `_open_once`. Live-camera regression skipped — the user's own UI instance was running at that moment (port 7860) and held the camera (one-camera-per-program rule applies to my tests too).
+
+**Next:** Block 3 — Wi-Fi drive-test firmware + `drive_test.py`.
+
+---
+
+## 2026-11-13 — Decision: NATIVE window replaces Gradio for detection
+
+**Why:** browser verification of detect_ui (driven with real browser automation + screenshot analysis) showed the camera opens, readout reports `camera 0 (1920x1080)` and fps counts — but the Arena view panel renders **solid black**. Meanwhile a plain-process check with the exact same open+drain pattern returned healthy frames (brightness 129/255 at 1920×1080). Camera and capture pipeline: proven good; Gradio→browser image transport: broken somewhere we couldn't see. One day before the exhibition, we stopped fighting it.
+
+**What we did:** rewrote `code/python/detect_test.py` as the full native app — one main-thread loop (`camera → detect → draw → cv2.imshow`), no threads, no browser: auto-detects the 1080p C920 (same probe logic), drain-reads for fresh frames, same overlays (green/blue boxes, magenta line, distance, line angle, yaw), banner "BOTH MARKERS DETECTED", bottom HUD (camera info, fps, ROBOT/TARGET state), `s`=snapshot / `q`/ESC=quit, console `[camera]`/`[frame]` diagnostics (brightness every 3 s). Still a library: `detect_ui.py` imports `ArucoDetector`/`center_of`/`yaw_deg` from it — API kept intact.
+
+**Second hard lesson (also true at the venue):** hard-killing a process that holds the camera (my TaskStops of the Gradio servers) skips `cap.release()` and after a few rounds **wedged the C920 driver** — every later open hung in fresh processes until the camera was unplugged/replugged. Rule for demo day: always close camera programs with q/ESC (or the Stop button), never by closing a terminal window with force / Task Manager, and if the camera ever "won't open": unplug-replug it.
+
+**Verification status:** library API + synthetic detection verified; live window check pending on the kid's next run (camera was driver-wedged at the end of this session; fixed by replug).
+
+**How to run the native UI:** `.venv\Scripts\python detect_test.py` (add `--scale 0.05` after Block 4 calibration, `--flip` if mounted upside down). Gradio `detect_ui.py` stays in the repo as a fallback.
+
+---
+
+## 2026-11-13 — detect_ui.py rewritten: Tkinter + Openencv (Gradio removed)
+
+**Why:** after the black-panel transport failure, the user asked for a native UI *with real controls* — best of both: `detect_ui.py` is now a **Tkinter** window (Python's built-in GUI) driving the same detection library. No browser, no server, no Gradio dependency at all (removed from requirements.txt — also makes the Ubuntu install much lighter).
+
+**What it has:** live video panel (960 px), green "BOTH MARKERS DETECTED" banner, per-marker badges (green/amber/red), monospace readout (fps, camera info, positions, px/cm distance, line angle, yaw), Stop/Start camera + Snapshot buttons, live settings (camera index entry — empty = auto 1080p detect, cm/px entry, 180° flip). Keys `s` / `q` / ESC still work (ignored while typing in an entry). Everything runs in the MAIN thread via `root.after(30, …)` — the camera-safe pattern proven on this laptop; window close and q/ESC release the camera cleanly (no driver wedge). Detection + camera code imported from `detect_test.py` — one source of truth.
+
+**Ubuntu note:** Tkinter needs `sudo apt install python3-tk` — added to docs/ubuntu-setup.md.
+
+**Verification:** compiles; imports without gradio and without creating a window; entry parsers (empty/junk/valid) and all four badge states tested; placeholder frame; synthetic both-marker detection through the shared `annotate` (602 px). Live window check pending the kid's next run (after C920 replug).
+
+**How to run:** `.venv\Scripts\python detect_ui.py` — or `detect_test.py` for the plain cv2 window; both share the same code.
+
+**Next:** Block 3 — Wi-Fi drive-test firmware + `drive_test.py`.
+
+---
+
+## 2026-11-13 — Block 3 code: Wi-Fi drive test (firmware + drive_test.py)
+
+**What we did:**
+- Firmware (`src/main.cpp`): NodeMCU opens an **open hotspot "VisionBot"** at `192.168.4.1`, listens for UDP on port **5005**. Text commands `F/B/L/R/S` + `V<0-1023>` (set speed). **600 ms deadman**: if commands stop, the robot stops itself (matches the loop-robustness design). Serial (9600) prints state changes. Same pins as the motor test — no rewiring.
+- Laptop (`code/python/drive_test.py`, **stdlib only, Windows AND Ubuntu** — keyboard via msvcrt on Windows, termios/select on Linux, like the camera code's platform split): W/A/S/D + arrow keys drive, SPACE stop, `+`/`-` speed in steps of 50, ESC = burst of STOPs + quit. Sends the current command 10×/s to feed the deadman.
+
+**Verification:** firmware compile-verified for `nodemcuv2` (esp8266 core 3.1.2); `drive_test.py` syntax-checked. Hardware run pending.
+
+**Numbers we used:** UDP port 5005 · 10 Hz command rate · deadman 600 ms · default speed 400/1023 ≈ 40% · speed step 50.
+
+**How to run:** join laptop Wi-Fi to "VisionBot", then `.venv\Scripts\python code\python\drive_test.py` (Windows) or `.venv/bin/python code/python/drive_test.py` (Ubuntu). Robot on the floor, ~3 m range.
+
+**Next:** drive it around (the reward after Block 2!), then test the deadman — laptop Wi-Fi off mid-drive must stop the robot in ~0.6 s. Then Block 4 acceptance run with the rig.
+
+---
+
+## 2026-11-13 — ✅ Tkinter UI CONFIRMED WORKING live
+
+User report after C920 replug: **"works perfect!"** — live video in the native Tkinter window. The camera/UI saga is closed: detection runs on a proven native stack (Tkinter + OpenCV, main-thread, DSHOW on Windows / V4L2 for the Ubuntu demo box).
+
+**Remaining on detection (Block 4 physical steps):** rig the camera ~120 cm over the arena → 2-minute 5-spot acceptance test (card at 4 corners + center, all badges green, corner markers 30–33 visible) → record px→cm scale (markers 30 cm apart) and robot yaw pointing N/E/S/W into this log.
+
+**Project state:** detection UI ✅ (live-confirmed) · Block 2 motors ✅ · Block 3 code ✅ written (hardware run pending) · `main.py` navigation — the last big piece.
+
+---
+
+## 2026-11-13 — Q&A: what the corner markers are for + placement rules
+
+**User question:** what is the use of the edge/corner markers (IDs 30–33)? Keep them always? Exact distances needed?
+
+**Answer (full guide:** [corner-markers.md](corner-markers.md)**):**
+- **Use:** per-frame perspective correction (homography) — true cm anywhere in the arena, and **self-healing after a camera bump at the venue**. Fallback without them: the single ruler px→cm scale (fine for our centered overhead rig) — the demo never depends on them, but taping them to the board permanently is the plan.
+- **Keep always?** Yes — tape/glue them permanently to the arena board so they travel with it; nothing to redo at the venue.
+- **Exact placement?** NOT needed — the homography learns the real geometry from wherever the four markers sit. What matters: **order as the camera sees it (30=TL, 31=TR, 32=BR, 33=BL** — swapped = mirrored driving = re-tape), each near its corner, flat, all four visible; plus the 10-second sanity check (robot at ID 30 appears top-left on screen). **One-time ruler measurement:** long + short side between taped markers → recorded for `main.py`'s true-cm mapping.

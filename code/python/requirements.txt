@@ -3,5 +3,4 @@
 # opencv-python 4.8+ has ArUco built in (older versions needed opencv-contrib-python)
 opencv-python>=4.8,<5
 numpy
-pillow          # A4 PDF print sheets in generate_markers.py
-gradio>=4.44,<7
+pillow          # A4 PDF print sheets + ImageTk in detect_ui.py (Tkinter UI)

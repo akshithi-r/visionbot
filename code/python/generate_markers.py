@@ -18,6 +18,7 @@ Output (in the markers/ folder next to this file):
   print_10_robot.png     full print sheets with FRONT arrow + instructions
   print_20_target.png
   print_a4_markers.pdf   BOTH markers, one per A4 page (easiest to print)
+                         + page 3: four ARENA CORNER markers (IDs 30-33)
 
 Printing: print the PDF at 100% scale ("Actual size", NOT "fit to page").
 The black square must measure 8 x 8 cm. Matte paper if possible. Glue
@@ -32,6 +33,12 @@ from PIL import Image, ImageDraw, ImageFont
 
 ROBOT_ID = 10
 TARGET_ID = 20
+# Arena corner markers, named as the CAMERA sees the picture. They are the
+# fixed reference points the navigation uses to correct a tilted/angled
+# camera (perspective). Different IDs so they can never be confused with
+# the robot (10) or the target card (20).
+CORNER_IDS = {"TL": 30, "TR": 31, "BR": 32, "BL": 33}
+CORNER_BLACK_PX = 709            # ~6 cm at 300 dpi - corners stay smaller
 SIDE_PX = 800          # 800 px printed at 8 cm = ~250 dpi, nicely sharp
 SHEET_W = 1200         # width of the print sheet
 OUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "markers")
@@ -172,6 +179,55 @@ def make_a4_page(marker, marker_id, who, is_robot):
     return img
 
 
+def make_corner_page():
+    """One A4 page with the four arena corner markers in a 2 x 2 grid."""
+    img = Image.new("L", (A4_W, A4_H), 255)
+    d = ImageDraw.Draw(img)
+    f_title = _font("arialbd.ttf", 84)
+    f_sub = _font("arial.ttf", 54)
+    f_label = _font("arialbd.ttf", 56)
+    f_tiny = _font("arial.ttf", 42)
+    cx = A4_W // 2
+
+    d.text((cx, 140), "VisionBot - ARENA CORNER MARKERS (IDs 30-33)",
+           font=f_title, fill=0, anchor="ma")
+    d.text((cx, 240), "These let the program correct an angled/tilted camera automatically.",
+           font=f_sub, fill=90, anchor="ma")
+    d.text((cx, 320), "Tape each one FLAT inside its arena corner, named as the CAMERA sees the picture:",
+           font=f_sub, fill=90, anchor="ma")
+
+    block = CORNER_BLACK_PX + 2 * (CORNER_BLACK_PX // 8)   # with quiet border
+    cell_w, cell_h = 1150, 1160
+    grid_x0 = (A4_W - 2 * cell_w) // 2
+    grid_y0 = 440
+    # reading order on the page: TL, TR / BL, BR
+    cells = [("TL", "ID 30 - TOP-LEFT corner"), ("TR", "ID 31 - TOP-RIGHT corner"),
+             ("BL", "ID 33 - BOTTOM-LEFT corner"), ("BR", "ID 32 - BOTTOM-RIGHT corner")]
+    for i, (corner, name) in enumerate(cells):
+        r, c = divmod(i, 2)
+        x0 = grid_x0 + c * cell_w
+        y0 = grid_y0 + r * cell_h
+        marker = make_marker(CORNER_IDS[corner], CORNER_BLACK_PX)
+        img.paste(Image.fromarray(marker), (x0 + (cell_w - block) // 2, y0))
+        d.rectangle([x0 + (cell_w - block) // 2 - CUT_MARGIN, y0 - CUT_MARGIN,
+                     x0 + (cell_w + block) // 2 + CUT_MARGIN, y0 + block + CUT_MARGIN],
+                    outline=140, width=4)
+        d.text((x0 + cell_w // 2, y0 + block + CUT_MARGIN + 70), name,
+               font=f_label, fill=0, anchor="ma")
+
+    y = grid_y0 + 2 * cell_h + 60
+    d.text((cx, y), "Each corner marker is ~6 x 6 cm and stays fixed for the whole demo.",
+           font=f_sub, fill=90, anchor="ma")
+    d.text((cx, y + 80), "Check on screen: a robot standing near ID 30 must appear at the TOP-LEFT of the picture.",
+           font=f_sub, fill=90, anchor="ma")
+    d.text((cx, y + 160), "If corners end up swapped on the arena, the robot will drive mirrored - just re-tape.",
+           font=f_sub, fill=90, anchor="ma")
+    d.text((cx, A4_H - 100),
+           "VisionBot science exhibition - ArUco DICT_4X4_50, corner markers",
+           font=f_tiny, fill=140, anchor="ma")
+    return img
+
+
 def main():
     os.makedirs(OUT_DIR, exist_ok=True)
     jobs = [(ROBOT_ID, "ROBOT (top of robot)", True),
@@ -191,14 +247,18 @@ def main():
         print(f"          print sheet: {sheet_path}")
 
     pdf_path = os.path.join(OUT_DIR, "print_a4_markers.pdf")
+    pdf_pages.append(make_corner_page())
     pdf_pages[0].save(pdf_path, save_all=True, append_images=pdf_pages[1:],
                       resolution=DPI, title="VisionBot ArUco markers (8 cm)")
-    print(f"          A4 PDF (2 pages): {pdf_path}")
+    print(f"          A4 PDF (3 pages, page 3 = arena corners): {pdf_path}")
 
     print("\nPrint print_a4_markers.pdf at 100% scale - the black square must")
     print("measure 8 x 8 cm (use the check bar with a ruler). If the print")
     print("comes out a bit off, that is okay for detection, but write the")
     print("real size in the project log.")
+    print("\nPage 3 (optional but recommended): cut the four corner markers")
+    print("and tape them flat inside the arena corners, matching the labels")
+    print("(TL=30, TR=31, BR=32, BL=33 as the CAMERA sees the picture).")
 
 
 if __name__ == "__main__":
