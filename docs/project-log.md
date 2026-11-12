@@ -345,3 +345,35 @@ User report after C920 replug: **"works perfect!"** — live video in the native
 - **Use:** per-frame perspective correction (homography) — true cm anywhere in the arena, and **self-healing after a camera bump at the venue**. Fallback without them: the single ruler px→cm scale (fine for our centered overhead rig) — the demo never depends on them, but taping them to the board permanently is the plan.
 - **Keep always?** Yes — tape/glue them permanently to the arena board so they travel with it; nothing to redo at the venue.
 - **Exact placement?** NOT needed — the homography learns the real geometry from wherever the four markers sit. What matters: **order as the camera sees it (30=TL, 31=TR, 32=BR, 33=BL** — swapped = mirrored driving = re-tape), each near its corner, flat, all four visible; plus the 10-second sanity check (robot at ID 30 appears top-left on screen). **One-time ruler measurement:** long + short side between taped markers → recorded for `main.py`'s true-cm mapping.
+
+---
+
+## 2026-11-13 — Block 3 first hardware run: radio works, right motor inverted
+
+**What happened:** Wi-Fi link, all four drive commands and `+`/`-` speed work. But directions came out scrambled: W=spin right, A=straight back, S=spin left, D=straight forward.
+
+**Diagnosis:** the pattern decodes to ONE fault — left wheel correct in every command, right wheel inverted in every command (e.g. W sends both-forward: left went forward, right went backward → spin right). So the right motor's two wires are swapped at the L298N. Radio/speed/deadman-feed all proven good — that's why speed worked fine.
+
+**Fix:** battery OFF, swap the right motor's wire pair at `OUT3`/`OUT4`, retest — expecting W=fwd, S=back, A=spin left, D=spin right. *(Retest result: ______ )* Lesson for the logbook: Block 2's wheels-up pass said "worked" but didn't compare each wheel's direction against the serial labels — checking that properly catches this on the cup, before the robot hits the floor.
+
+**Still to test:** the deadman (laptop Wi-Fi off mid-drive → robot self-stops in ~0.6 s).
+
+**Next:** retest after the wire swap → deadman test → Block 3 ✅.
+
+---
+
+## 2026-11-13 — main.py: the full autonomous program (Block 5 code)
+
+**User request:** one separate program — CustomTkinter + OpenCV UI, corner-marker detection, drive the robot to the target at a constant speed controllable in the UI, commands over Wi-Fi. Built as `code/python/main.py` (the plan's Block-5 program).
+
+**What it is:**
+- **ArenaMap** — corner markers 30–33 → per-frame homography → true cm positions AND heading (the robot's front vector is mapped through the homography too, so a rotated camera corrects itself). Corner hidden → cached last-good map. No corners ever → single ruler-scale fallback (cm/px entry).
+- **Navigator** — the locked simple loop: turn-in-place → straight → stop. ONE constant speed (slider 10–100%, default 40%). Angle tol slider (20°), stop tol slider (10 cm). Arrived latches until the card moves >5 cm out (visitor moves card → robot re-aims). Marker lost → hold last command 3 frames → STOP. Yaw smoothed (vector-mean of last 5). Runtime fix toggles: **invert turn direction** + **heading offset** — sign problems get fixed at the UI, no code edits at the venue.
+- **RobotLink** — same UDP protocol the firmware already speaks (F/B/L/R/S + V, 10 Hz keepalive feeding the 600 ms deadman). Stop burst on PAUSE/E-STOP/quit/window close.
+- **UI** — live annotated video (boxes, cm distance, heading arrow, err°), state banner color-coded (TURNING/DRIVING/ARRIVED/LOST), E-STOP button (ESC), START (SPACE), snapshot, camera start/stop + auto-detect (the proven DSHOW/V4L2 main-thread pattern), monospace readout (state, arena mode, dist/err, tolerances, packet count, fps).
+
+**Verification (9 headless checks, all passed):** synthetic 6-marker frames → homography cm exact vs ground truth (25.0/35.0 cm, dist 28.6 cm); facing-target → `F` (err 0°); rotated → TURN with invert flipping R↔L; 4 cm → ARRIVED latch, card moved 30 cm → resumes; marker loss → holds F,F,F then S + LOST; corner removed → cached map identical; no-corner frame → ruler-scale mode; UDP loopback → exact wire bytes `F`,`V400`,`S×5`; GUI construct/params/readout/shutdown clean. customtkinter 6.0.0 installed into `.venv`, added to requirements.txt.
+
+**Live checklist for the first run:** ① rig camera + tape corners, robot+card in view ② check "corners (live)" in the readout ③ press START: if the robot turns AWAY from the card, tick "Invert turn direction" ④ adjust speed slider live. Full rig acceptance test = the 2-minute corner walk from the placement rules.
+
+**Next:** live closed-loop run on the real arena (Block 5 checkpoint: card reached 5× in a row), then Block 6 safety demos (cover camera → stop; Wi-Fi off → deadman) and rehearsal.

@@ -4,3 +4,4 @@
 opencv-python>=4.8,<5
 numpy
 pillow          # A4 PDF print sheets + ImageTk in detect_ui.py (Tkinter UI)
+customtkinter   # main.py navigation UI (modern Tk widgets)
