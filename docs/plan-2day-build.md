@@ -22,15 +22,15 @@
 
 ### Decision 1 — The robot is UNTETHERED (no cable to the laptop)
 
-The ESP32 cannot stay powered from the laptop USB while the robot is driving — the cable will snag. So:
+The NodeMCU cannot stay powered from the laptop USB while the robot is driving — the cable will snag. So:
 
 | Part | Powered by |
 |---|---|
 | Motors + L298N | 4×1.5V battery pack (6V) → L298N `+12V` and `GND` |
-| ESP32 (now) | Small USB power bank on the chassis *(best with the 6V pack — the L298N's onboard 5V regulator is unreliable below 7V)* |
-| ESP32 (later, exhibition) | 6×NiMH (7.2V) pack → L298N `+12V`, and L298N `5V` output → ESP32 `VIN` (keep the 5V jumper ON) |
+| NodeMCU (now) | Small USB power bank on the chassis *(best with the 6V pack — the L298N's onboard 5V regulator is unreliable below 7V)* |
+| NodeMCU (later, exhibition) | 6×NiMH (7.2V) pack → L298N `+12V`, and L298N `5V` output → NodeMCU `VIN` (keep the 5V jumper ON) |
 
-**Communication:** laptop → ESP32 over **Wi-Fi using UDP**. The ESP32 creates its own hotspot (`VisionBot`); the laptop joins it. No venue Wi-Fi needed, no cables, and the link that drives the motors also becomes our emergency-stop path.
+**Communication:** laptop → NodeMCU over **Wi-Fi using UDP**. The NodeMCU creates its own hotspot (`VisionBot`); the laptop joins it. No venue Wi-Fi needed, no cables, and the link that drives the motors also becomes our emergency-stop path.
 
 ### Decision 2 — Slow and simple wins
 
@@ -44,12 +44,12 @@ The ESP32 cannot stay powered from the laptop USB while the robot is driving —
 - [ ] Arena: white foam board or chart paper, ~100 × 70 cm, **matte** (not glossy — glare kills detection)
 - [ ] Thick card stock: one 12×12 cm destination card + one small plate for the robot's marker
 - [ ] USB power bank + cable (most homes have one)
-- [ ] 4×AA battery holder **with a switch** (and a 6×AA holder for the NiMH pack later)
+- [ ] 4×AA battery holder — with or without its own switch (no switch on yours? any small on/off switch works, wiring in [wiring-nodemcu-l298n.md](wiring-nodemcu-l298n.md)) — and a 6×AA holder for the NiMH pack later
 - [ ] Camera mount — pick ONE (details in §2b): cardboard bridge (centered overhead) OR lamp-arm/tripod (angled, from one side)
 - [ ] One big cardboard delivery box (mount material — doubles as the packing box) + a ruler or dowel for a crossbar
 - [ ] Two table lamps (we control the lighting, not the exhibition hall)
 - [ ] Double-sided tape, normal tape, zip ties, scissors
-- [ ] **Software (parent, ~40 min):** Python 3.11+ installed; `pip install opencv-python numpy`; Arduino IDE with ESP32 board support added
+- [ ] **Software (parent, ~40 min):** Python 3.11+ installed; `pip install opencv-python numpy`; PlatformIO IDE (already set up — the blink test ran on it)
 - [ ] Print the two ArUco markers once `code/python/generate_markers.py` is ready (next work session)
 
 ### 2b. Camera mounting — you do NOT need a cage
@@ -75,25 +75,25 @@ Whichever you choose:
 
 Parent checks every connection against this table **before** the first power-on.
 
-### Signals: ESP32 → L298N
+### Signals: NodeMCU → L298N
 
-| L298N pin | ESP32 pin | Notes |
+| L298N pin | NodeMCU pin | Notes |
 |---|---|---|
-| ENA | GPIO 32 | Left motor speed (PWM) — **remove the ENA jumper cap** |
-| IN1 | GPIO 25 | Left motor direction |
-| IN2 | GPIO 26 | Left motor direction |
-| IN3 | GPIO 27 | Right motor direction |
-| IN4 | GPIO 14 | Right motor direction |
-| ENB | GPIO 33 | Right motor speed (PWM) — **remove the ENB jumper cap** |
+| ENA | D1 (GPIO 5) | Left motor speed (PWM) — **remove the ENA jumper cap** |
+| IN1 | D5 (GPIO 14) | Left motor direction |
+| IN2 | D6 (GPIO 12) | Left motor direction |
+| IN3 | D7 (GPIO 13) | Right motor direction |
+| IN4 | D0 (GPIO 16) | Right motor direction (D0 has no PWM — fine, direction is just on/off) |
+| ENB | D2 (GPIO 4) | Right motor speed (PWM) — **remove the ENB jumper cap** |
 | GND | GND | **Common ground is mandatory** — robot won't move reliably without it |
 
-GPIOs 0, 2, 12, 15 are deliberately avoided (boot-strapping pins — motors on those can prevent the ESP32 from starting).
+D3 (GPIO 0), D4 (GPIO 2) and D8 (GPIO 15) are deliberately avoided (boot-strapping pins — motors on those can stop the NodeMCU from starting). Full guide: [wiring-nodemcu-l298n.md](wiring-nodemcu-l298n.md).
 
 ### Power
 
-- Battery pack (+) → L298N `+12V`, battery (−) → L298N `GND`
+- Battery pack (+) → [switch if the holder has none] → L298N `+12V`, battery (−) → L298N `GND`
 - Keep the small **5V jumper ON** the L298N
-- Power bank → ESP32 USB socket (for now)
+- Power bank → NodeMCU USB socket (for now)
 
 ---
 
@@ -103,7 +103,7 @@ GPIOs 0, 2, 12, 15 are deliberately avoided (boot-strapping pins — motors on t
 
 1. Mount the two BO motors near one end of the chassis (double-sided tape + zip ties).
 2. Attach wheels; fix the caster wheel at the opposite end.
-3. Mount: L298N, ESP32, battery holder (switch reachable), power bank.
+3. Mount: L298N, NodeMCU, battery holder (switch reachable), power bank.
 4. Tape the marker plate flat on top of the robot — **must be level**, not tilted.
 5. Photo for the logbook.
 
@@ -112,7 +112,7 @@ GPIOs 0, 2, 12, 15 are deliberately avoided (boot-strapping pins — motors on t
 ### Block 2 · Wiring + motor test (~1.5 h)
 
 1. Wire everything per the table above with the battery **off**. Parent inspects.
-2. Parent flashes `code/esp32/VisionBot.ino` motor-test mode (or a tiny test sketch); robot **on a cup, wheels up**.
+2. Parent uploads `code/bot-program/bot-code/` (PlatformIO — the **→ Upload** arrow); robot **on a cup, wheels up**.
 3. Test: forward, left turn, right turn, stop. Kid watches each wheel.
 4. A wheel spinning the wrong way = swap that motor's two wires at the L298N terminal. (This is normal — expect it once.)
 
@@ -120,7 +120,7 @@ GPIOs 0, 2, 12, 15 are deliberately avoided (boot-strapping pins — motors on t
 
 ### Block 3 · Wi-Fi driving test (~1.5 h) — *the fun one*
 
-1. ESP32 firmware creates hotspot `VisionBot`; laptop joins it.
+1. NodeMCU firmware creates hotspot `VisionBot`; laptop joins it.
 2. Run `code/python/drive_test.py` — keys **W/A/S/D** drive the robot.
 3. Kid drives it around the floor untethered. Seriously — play with it 10 minutes. This validates power, motors and radio in one go, and it's the reward after Block 2.
 
@@ -159,7 +159,7 @@ Expected and *normal* fixes: left/right inverted (swap IN3/IN4 wire or one line 
 
 1. Marker lost from view → laptop sends STOP automatically (already in the code); test by covering the camera.
 2. **SPACE = START, ESC = emergency STOP** shown on screen.
-3. Radio lost → ESP32 stops motors by itself after 0.6 s of silence (deadman timer) — test by turning off laptop Wi-Fi mid-drive.
+3. Radio lost → NodeMCU stops motors by itself after 0.6 s of silence (deadman timer) — test by turning off laptop Wi-Fi mid-drive.
 
 ✅ **Checkpoint:** robot stops on camera-covered and Wi-Fi-off tests.
 

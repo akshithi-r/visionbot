@@ -111,3 +111,29 @@ A perfectly-centered camera goes through the same calibration — one code path 
 **Printing note (supersedes the PNG-sheet note above):** print `print_a4_markers.pdf` at **100% / "Actual size"**; after printing, lay a ruler on the check bar — it must read 8.0 cm. Reprint page 2 for spare destination cards. **Keep the white border when cutting** — the detector needs it.
 
 **Next:** ESP32 firmware (`code/esp32/`) + Wi-Fi drive test (`drive_test.py`); then `calibrate.py` + `main.py`.
+
+---
+
+## 2026-11-12 — Board correction: it's a NodeMCU (ESP8266), not an ESP32
+
+**What we did:** While wiring the 4×AA pack + switch + L298N, we caught that the robot board is a **NodeMCU v2 (ESP-12E = ESP8266)** — not a 30-pin ESP32 DevKit as the earlier wiring plan assumed. Both boards have 30 pins, which is how the mix-up happened. The firmware had been right all along: `platformio.ini` → `nodemcuv2`, and the blink test ran on it. Rewrote the wiring guide: [wiring-nodemcu-l298n.md](wiring-nodemcu-l298n.md) (replaces the ESP32 version) and updated plan-2day-build.md + Readme.md to match.
+
+**New pin map (NodeMCU → L298N):** D1→ENA, D2→ENB (the two PWM pins), D5→IN1, D6→IN2, D7→IN3, D0→IN4 (D0 has no PWM — fine for a direction pin). D3/D4/D8 deliberately avoided (boot-strapping pins).
+
+**4×AA alkaline wiring (for now):** pack (+) → [switch] → L298N `+12V`; pack (−) → `GND`; motors → OUT1–4; NodeMCU stays on the USB power bank (the L298N's 5V regulator is unreliable below 7V input). Exhibition: 6×NiMH 7.2V, then L298N `5V` → NodeMCU `VIN`, power bank retired.
+
+**What broke / how we fixed it:** three docs written for the wrong board — all corrected in one pass before any wiring was done. No hardware harm.
+
+**Next:** motor-test firmware in `code/bot-program/bot-code/` (extend the PlatformIO project) + Wi-Fi drive test (`drive_test.py`).
+
+---
+
+## 2026-11-12 — Motor-test firmware (Day 1, Block 2)
+
+**What we did:** Wrote the motor-test firmware into the PlatformIO project `code/bot-program/bot-code/src/main.cpp` — cycles STOP → FORWARD → BACKWARD → LEFT → RIGHT (2 s each, wheels-up test) forever, with serial output (9600 baud) saying what each wheel SHOULD be doing at every step. Wrong-direction wheel = swap that motor's two wires at the L298N terminal (expected once).
+
+**Verification:** compile-verified for `nodemcuv2` (esp8266 core 3.1.2): RAM 35%, flash 22%. Hardware run still to do (Block 2 checklist).
+
+**Numbers we used:** TEST_SPEED = 400/1023 ≈ 40% PWM — matches the plan's starting value.
+
+**Next:** upload via PlatformIO (→ Upload, monitor 9600), robot on a cup, run the Block 2 checklist (watch each wheel). Then Wi-Fi drive-test firmware + `drive_test.py`.

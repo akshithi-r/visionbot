@@ -14,7 +14,7 @@ The project uses a camera mounted above a small arena. Two specially designed vi
 
 When a visitor places the destination card anywhere inside the arena and presses the START button, the computer identifies both markers using a camera. It calculates the distance and direction between the robot and the destination using mathematical formulas.
 
-The computer then sends movement instructions to an ESP32 microcontroller, which controls the robot's motors. The camera continuously tracks the robot, allowing the computer to correct its movement until it reaches the destination.
+The computer then sends movement instructions to a NodeMCU (ESP8266) microcontroller, which controls the robot's motors. The camera continuously tracks the robot, allowing the computer to correct its movement until it reaches the destination.
 
 This project demonstrates how computer vision, mathematics, programming and robotics can work together to create an autonomous system.
 
@@ -43,7 +43,7 @@ The main objectives of this project are:
 1. To understand how computers interpret visual information through computer vision.
 2. To identify objects and positions using ArUco visual markers.
 3. To understand coordinate geometry and distance calculations.
-4. To control a physical robot using an ESP32 microcontroller.
+4. To control a physical robot using a NodeMCU (ESP8266) microcontroller.
 5. To implement autonomous navigation using continuous camera feedback.
 6. To demonstrate how computers, mathematics and robotics work together.
 
@@ -53,7 +53,7 @@ The main objectives of this project are:
 
 | Component | Purpose |
 |---|---|
-| ESP32 development board | Main robot controller |
+| NodeMCU (ESP8266) development board | Main robot controller |
 | 2 DC BO geared motors | Drive the robot |
 | 2 wheels | Robot movement |
 | 1 caster wheel | Mechanical support and balance |
@@ -71,8 +71,8 @@ The main objectives of this project are:
 - Python – Main programming language.
 - OpenCV – Image processing and ArUco marker detection.
 - NumPy – Mathematical calculations.
-- PySerial or Wi-Fi communication – Laptop-to-ESP32 communication.
-- ESP32 Arduino framework – Motor control programming.
+- PySerial or Wi-Fi communication – Laptop-to-NodeMCU communication.
+- ESP8266 Arduino framework (PlatformIO) – Motor control programming.
 
 ## 6. System Architecture
 
@@ -103,7 +103,7 @@ Using Python and OpenCV, it:
 
 ### C. Communication System
 
-The laptop communicates with the ESP32 and sends movement commands.
+The laptop communicates with the NodeMCU and sends movement commands.
 
 For example:
 
@@ -116,7 +116,7 @@ Wi-Fi can be used to avoid a trailing communication cable during movement. USB s
 
 ### D. Robotics System
 
-The ESP32 receives the movement commands and controls the L298N motor driver.
+The NodeMCU receives the movement commands and controls the L298N motor driver.
 
 The motor driver independently controls the left and right motors, allowing the robot to move forward, turn and stop.
 
@@ -152,9 +152,9 @@ Based on the calculations, the computer decides whether the robot should move fo
 
 **Step 6: Motor Control**
 
-The computer sends movement instructions to the ESP32.
+The computer sends movement instructions to the NodeMCU.
 
-The ESP32 controls the motors through the motor driver.
+The NodeMCU controls the motors through the motor driver.
 
 **Step 7: Continuous Monitoring**
 
