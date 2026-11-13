@@ -722,6 +722,10 @@ class VisionBotApp(ctk.CTk):
         self.e_head = entry_row("Heading offset (deg)", "0", r); r += 1
         self.e_csize = entry_row("Corner marker (cm)", "6", r); r += 1
         self.e_scale = entry_row("cm/px (no corners)", "0.05", r); r += 1
+        ctk.CTkButton(panel, text="Ruler check: card 30 cm from robot",
+                      height=30, command=self._ruler_check).grid(
+            row=r, column=0, columnspan=2, sticky="ew", padx=12, pady=(2, 4))
+        r += 1
         self.e_cam = entry_row("Camera (empty=auto)", "", r); r += 1
         self.e_ip = entry_row("Robot IP", ROBOT_IP, r); r += 1
 
@@ -766,6 +770,31 @@ class VisionBotApp(ctk.CTk):
     def _stoptol_changed(self, value):
         self.stoptol_lab.configure(text=f"{int(value)} cm")
         self._nav_params_changed()
+
+    def _ruler_check(self):
+        """One-press scale calibration: place the card EXACTLY 30 cm from
+        the robot marker (ruler/tape, robot near the arena centre to
+        minimise parallax), both visible on screen, then press. The corner
+        marker size is corrected so the reading becomes exactly 30 cm."""
+        d = self.nav.dist_cm
+        if not (15.0 <= d <= 60.0):
+            self.banner.configure(
+                text="Ruler check: put the card 30 cm from the robot marker "
+                     "(both visible), then press again",
+                text_color="#e0a020")
+            return
+        old = self.arena.corner_marker_cm
+        new = min(12.0, max(3.0, old * 30.0 / d))
+        self.e_csize.delete(0, "end")
+        self.e_csize.insert(0, f"{new:.1f}")
+        self.arena.last_scale = None          # adopt the new scale instantly
+        self._nav_params_changed()
+        print(f"[calibrate] ruler check: read {d:.1f} cm for a true 30 cm -> "
+              f"corner marker size {old:.1f} -> {new:.1f} cm")
+        self.banner.configure(
+            text=f"Scale calibrated: reads 30.0 cm now (marker size "
+                 f"{old:.1f} -> {new:.1f} cm)",
+            text_color="#30b030")
 
     # ------------------------------------------------ control actions
     def _start(self):
