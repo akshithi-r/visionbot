@@ -509,6 +509,7 @@ class Navigator:
         self.turn_invert = False    # flip turn direction if it turns AWAY
         self.heading_offset = 0.0   # deg - fixes a marker taped slightly off
         self.turn_rate = self.RATE0 # learned during the run
+        self.drive_speed = 15.0     # cm/s - learned during the run
         self.reset()
 
     def reset(self):
@@ -523,6 +524,9 @@ class Navigator:
         self._slice_s = 0.0         # planned length of the current burst
         self._heading_before = None # heading at turn-burst start (rate learn)
         self._turn_dir = None       # committed turn direction (L/R)
+        self._t_accum = 0.0         # running time (s) for burst learning
+        self._move_t = 0.0          # time actually spent MOVING this burst
+        self._pend = None           # pending (kind, before) measurement
 
     # ---- helpers ----
     def _smooth_heading(self, heading):
@@ -555,6 +559,34 @@ class Navigator:
         self.yaw_hist.clear()          # next measurement = still frames only
         self.last_cmd = "S"
 
+    def _learn_from_pend(self, robot_cm):
+        """Learn turn rate / drive speed from SETTLED-to-settled measurements
+        (both ends still), divided by the time actually spent MOVING - the
+        settle pause must not dilute the rate, and mid-motion readings read
+        low (the smoothed heading lags while rotating), which made every
+        burst overshoot."""
+        if not self._pend:
+            return
+        kind, before = self._pend
+        dt = self._move_t
+        self._pend = None
+        if dt < 0.15:
+            return
+        if kind == "turn":
+            dh = abs(wrap180(self._heading_now - before))
+            measured = dh / dt
+            if measured > 1.0:
+                self.turn_rate = min(
+                    max(0.35 * measured + 0.65 * self.turn_rate,
+                        self.RATE_MIN), self.RATE_MAX)
+        else:
+            d = math.hypot(robot_cm[0] - before[0], robot_cm[1] - before[1])
+            measured = d / dt
+            if measured > 1.0:
+                self.drive_speed = min(
+                    max(0.35 * measured + 0.65 * self.drive_speed,
+                        3.0), 60.0)
+
     def peek(self, robot_cm, heading_deg, target_cm):
         """Refresh the DISPLAYED dist/err without acting (robot not armed).
         Also powers the heading-offset calibration: aim the robot at the
@@ -568,12 +600,21 @@ class Navigator:
         # ---- marker dropout: hold briefly, then fail safe ----
         if not (seen_robot and seen_target):
             self.miss += 1
+            # mid-burst: pushing a blind command while the camera can't see
+            # is how the robot leaves the arena - cut the burst at once
+            if self.miss >= 2 and self.state in ("TURNING", "DRIVING"):
+                self._settle()
+                return "S", self.speed
             if self.miss > self.HOLD_FRAMES:
                 self.state = "LOST"
+                self._pend = None
                 self.last_cmd = "S"
             return self.last_cmd, self.speed
         self.miss = 0
         self._phase_t += dt
+        self._t_accum += dt
+        if self.state in ("TURNING", "DRIVING"):
+            self._move_t += dt
 
         # positions/errors refresh every frame (mid-burst stop checks)
         self._measure(robot_cm, heading_deg, target_cm)
@@ -590,25 +631,28 @@ class Navigator:
                 return "S", self.speed
         if self.dist_cm <= self.stop_tol:
             self.state = "ARRIVED"
+            self._pend = None
             self.last_cmd = "S"
             return "S", self.speed
 
-        # ---- stopped: wait out the settle, then decide ONE burst ----
+        # ---- stopped: learn from the last burst, then decide ONE burst ----
         if self.state in ("IDLE", "SETTLE"):
             self.last_cmd = "S"
             if self._phase_t < self.SETTLE_S:
                 return "S", self.speed
+            self._learn_from_pend(robot_cm)
             a = abs(self.err_deg)
             if a >= self.angle_tol:
-                # aim a little SHORT of the line - overshooting past it
-                # (worst: past the +/-180 back axis) flips the sign and
-                # the robot circles endlessly
-                dur = (a - 5.0) / self.turn_rate
+                # aim short of the line - overshooting past it (worst: past
+                # the +/-180 back axis) flips the sign and circles endlessly
+                short = max(5.0, 0.12 * a)
+                dur = (a - short) / self.turn_rate
                 if a > 150.0:
                     dur = min(dur, 0.5)     # approach the back axis in steps
                 self._slice_s = min(max(dur, self.TURN_MIN_S), self.TURN_MAX_S)
-                self._heading_before = self._heading_now
-                # Near +/-180 BOTH directions are equally short - commit to
+                self._pend = ("turn", self._heading_now)
+                self._move_t = 0.0
+                # near +/-180 BOTH directions are equally short - commit to
                 # one instead of re-choosing from the noisy sign each burst
                 if a > 150.0 and self._turn_dir in ("L", "R"):
                     cmd = self._turn_dir
@@ -619,7 +663,11 @@ class Navigator:
                 self._phase_t = 0.0
                 self.last_cmd = cmd
                 return cmd, self._v_turn()
-            self._slice_s = self.DRIVE_S
+            # drive burst sized to END at the tolerance edge (learned speed)
+            dur = (self.dist_cm - 0.7 * self.stop_tol) / self.drive_speed
+            self._slice_s = min(max(dur, 0.2), self.DRIVE_S)
+            self._pend = ("drive", robot_cm)
+            self._move_t = 0.0
             self.state = "DRIVING"
             self._phase_t = 0.0
             self.last_cmd = "F"
@@ -628,20 +676,14 @@ class Navigator:
         # ---- turning burst ----
         if self.state == "TURNING":
             if self._phase_t >= self._slice_s:
-                # learn the real turn rate from what actually happened
-                if self._heading_before is not None and self._phase_t > 0.05:
-                    dh = abs(wrap180(self._heading_now - self._heading_before))
-                    measured = dh / self._phase_t
-                    self.turn_rate = min(max(0.3 * measured
-                                             + 0.7 * self.turn_rate,
-                                             self.RATE_MIN), self.RATE_MAX)
                 self._settle()
                 return "S", self.speed
             self.last_cmd = self._turn_dir or self._turn_cmd(self.err_deg)
             return self.last_cmd, self._v_turn()
 
-        # ---- driving burst ----
-        if self._phase_t >= self._slice_s:
+        # ---- driving burst: straight, bail out early if the aim blows ----
+        if self._phase_t >= self._slice_s or \
+                abs(self.err_deg) > 0.8 * self.angle_tol:
             self._settle()
             return "S", self.speed
         self.last_cmd = "F"
