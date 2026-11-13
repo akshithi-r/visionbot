@@ -278,6 +278,7 @@ class ArenaMap:
         self.last_scale = None       # cm/px derived from the markers (cached)
         self.H = None                # live homography this frame
         self.last_good_H = None      # cache while a corner is hidden
+        self.corner_error = None     # "mirrored" if 30-33 taped in wrong order
 
     def configure(self, corner_marker_cm, cm_per_px):
         self.corner_marker_cm = float(corner_marker_cm)
@@ -288,6 +289,21 @@ class ArenaMap:
         if all(cid in found for cid in CORNER_IDS):
             centers = np.array([center_of(found[cid]) for cid in CORNER_IDS],
                                dtype=np.float32)
+            # Sanity: 30->31->32->33 must run around the quad the SAME way
+            # as the destination rectangle. A mirrored taping (e.g. two
+            # corners swapped as the camera sees them) passes detection but
+            # flips the whole navigation frame -> random turning. Shoelace
+            # sign tells us: it must be positive like the dst rectangle.
+            shoelace = 0.0
+            for i in range(4):
+                x1, y1 = centers[i]
+                x2, y2 = centers[(i + 1) % 4]
+                shoelace += x1 * y2 - x2 * y1
+            if shoelace <= 0:
+                self.corner_error = "mirrored"
+                self.H = None        # refuse the bad frame (scale fallback)
+                return
+            self.corner_error = None
             sides = []
             for cid in CORNER_IDS:
                 q = found[cid].reshape(4, 2)
@@ -350,48 +366,50 @@ class ArenaMap:
 
 # =========================================================== navigation
 class Navigator:
-    """The decision box. Pure logic, no camera/UI - kept testable on its own.
+    """STEP-THEN-LOOK controller: move a little -> STOP -> look -> correct.
 
-    Anti-zigzag design (replaces the old bang-bang turn-or-drive):
-      1. HYSTERESIS - turn until |err| <= aim_in (~12 deg), then commit to
-         driving and don't re-turn until |err| >= angle_tol (~25 deg). The
-         gap kills boundary chatter.
-      2. PROPORTIONAL TURN SPEED - between a stall-safe floor (300/1023,
-         ~29%) and the drive-speed slider. Field-measured: these motors
-         stall below ~25% PWM; the floor keeps both wheels turning.
-      3. PULSE-STEERING while driving - inside the hysteresis band the robot
-         gets short turn pulses between straight ticks (like a servo), so it
-         curves gently toward the line instead of slam-turn/overshoot.
+    (The kid's idea: acknowledge the feedback before every few steps.)
+    Continuous streaming correction fought this hardware - loop latency,
+    yaw jitter, and motors that only work in a narrow 25-40% PWM band.
+    Instead every move is a short burst, then the robot STOPS and the next
+    decision comes from a still, sharp image. Turn bursts self-calibrate:
+    each burst measures how much the heading really changed, so the app
+    learns the robot's true turn rate (deg/s) within a few bursts.
     """
 
+    SETTLE_S = 0.35      # stopped time before measuring (motion blur dies)
+    DRIVE_S = 0.7        # one straight burst
+    TURN_MIN_S = 0.15
+    TURN_MAX_S = 0.9
     HOLD_FRAMES = 3      # repeat last command this long when a marker drops
     RESUME_CM = 5.0      # arrived unlatches when the card moves this far out
-    PULSE_EVERY = 4      # while drift-steering: 1 turn tick per 4 ticks
-    YAW_SMOOTH = 7       # heading is the jitteriest number - smooth hard
+    YAW_SMOOTH = 5
+    RATE0 = 90.0         # initial turn-rate guess (deg/s)
+    RATE_MIN, RATE_MAX = 25.0, 240.0
+    TURN_FLOOR_PWM = 300 # ~29% - safely above the measured ~25% stall
 
     def __init__(self):
         self.speed = 400            # 0..1023, drive speed (slider)
-        self.angle_tol = 25.0       # deg - DRIVING re-turns only above this
-        self.stop_tol = 10.0        # cm - within this, arrived
+        self.angle_tol = 25.0       # deg - re-aim if the error is past this
+        self.stop_tol = 12.0        # cm - within this, arrived
         self.turn_invert = False    # flip turn direction if it turns AWAY
         self.heading_offset = 0.0   # deg - fixes a marker taped slightly off
+        self.turn_rate = self.RATE0 # learned during the run
         self.reset()
 
     def reset(self):
-        self.state = "IDLE"         # IDLE / TURNING / DRIVING / ARRIVED / LOST
+        self.state = "IDLE"         # IDLE/SETTLE/TURNING/DRIVING/ARRIVED/LOST
         self.last_cmd = "S"
         self.miss = 0
         self.yaw_hist = deque(maxlen=self.YAW_SMOOTH)
         self.err_deg = 0.0
         self.dist_cm = 0.0
-        self._pulse = 0
-        self._last_v = None
+        self._heading_now = 0.0
+        self._phase_t = 0.0         # seconds into the current phase
+        self._slice_s = 0.0         # planned length of the current burst
+        self._heading_before = None # heading at turn-burst start (rate learn)
 
     # ---- helpers ----
-    def aim_in(self):
-        """Inside this we consider the aim good (stop turning / go straight)."""
-        return max(6.0, 0.55 * self.angle_tol)
-
     def _smooth_heading(self, heading):
         self.yaw_hist.append(math.radians(heading))
         xs = [math.cos(a) for a in self.yaw_hist]
@@ -404,24 +422,27 @@ class Navigator:
             c = "L" if c == "R" else "R"
         return c
 
-    # Motors measured in the field: below ~25% PWM they stall (hum, no
-    # motion), above ~40% the robot is too fast. So turning uses ABSOLUTE
-    # PWM bounds - never a fraction of the slider that could sink below
-    # the stall point: floor 300/1023 (~29%, safely above stall), ceiling
-    # = the drive-speed slider.
-    TURN_FLOOR_PWM = 300
+    def _v_turn(self):
+        """Constant burst speed: above stall, tame enough to stay sharp."""
+        return max(self.TURN_FLOOR_PWM, min(500, self.speed))
 
-    def _turn_speed(self, err):
-        """Proportional from the stall-safe floor up to the drive speed."""
-        frac = min(1.0, abs(err) / 90.0)
-        lo = self.TURN_FLOOR_PWM
-        hi = max(lo, self.speed)
-        return int(lo + frac * (hi - lo))
+    def _measure(self, robot_cm, heading_deg, target_cm):
+        dx = target_cm[0] - robot_cm[0]
+        dy = target_cm[1] - robot_cm[1]
+        self.dist_cm = math.hypot(dx, dy)
+        bearing = math.degrees(math.atan2(dy, dx))
+        self._heading_now = self._smooth_heading(heading_deg) + self.heading_offset
+        self.err_deg = wrap180(bearing - self._heading_now)
 
-    # ---- the decision ----
-    def step(self, seen_robot, seen_target, robot_cm, heading_deg, target_cm):
-        """One decision per frame. Returns (cmd, speed) - speed is the PWM
-        value the robot should use right now (app sends V only on change)."""
+    def _settle(self):
+        self.state = "SETTLE"
+        self._phase_t = 0.0
+        self.yaw_hist.clear()          # next measurement = still frames only
+        self.last_cmd = "S"
+
+    # ---- the decision (call every UI tick; dt = seconds since last call) --
+    def step(self, seen_robot, seen_target, robot_cm, heading_deg, target_cm,
+             dt=0.03):
 
         # ---- marker dropout: hold briefly, then fail safe ----
         if not (seen_robot and seen_target):
@@ -431,48 +452,64 @@ class Navigator:
                 self.last_cmd = "S"
             return self.last_cmd, self.speed
         self.miss = 0
+        self._phase_t += dt
 
-        dx = target_cm[0] - robot_cm[0]
-        dy = target_cm[1] - robot_cm[1]
-        self.dist_cm = math.hypot(dx, dy)
-        bearing = math.degrees(math.atan2(dy, dx))
-        heading = self._smooth_heading(heading_deg) + self.heading_offset
-        self.err_deg = wrap180(bearing - heading)
+        # positions/errors refresh every frame (mid-burst stop checks)
+        self._measure(robot_cm, heading_deg, target_cm)
+
+        if self.state == "LOST":       # markers back - restart carefully
+            self._settle()
 
         # ---- arrived: latch until the card is moved again ----
         if self.state == "ARRIVED":
             if self.dist_cm > self.stop_tol + self.RESUME_CM:
-                self.state = "IDLE"             # card moved - re-aim
+                self._settle()
             else:
                 self.last_cmd = "S"
                 return "S", self.speed
-
         if self.dist_cm <= self.stop_tol:
             self.state = "ARRIVED"
             self.last_cmd = "S"
             return "S", self.speed
 
-        # ---- phase transitions (hysteresis band: aim_in .. angle_tol) ----
-        a = abs(self.err_deg)
-        if self.state != "TURNING" and a >= self.angle_tol:
-            self.state = "TURNING"
-            self._pulse = 0
-        elif self.state == "TURNING" and a <= self.aim_in():
-            self.state = "DRIVING"              # aim good - commit to driving
-            self._pulse = 0
-
-        # ---- act ----
-        if self.state == "TURNING":
-            self.last_cmd = self._turn_cmd(self.err_deg)
-            return self.last_cmd, self._turn_speed(self.err_deg)
-
-        # DRIVING (straight, with gentle pulse-steering inside the band)
-        self._pulse += 1
-        if self.aim_in() < a < self.angle_tol and self._pulse % self.PULSE_EVERY == 0:
-            self.last_cmd = self._turn_cmd(self.err_deg)      # one nudge tick
-            return self.last_cmd, self._turn_speed(self.err_deg)
-        if self.state == "IDLE":
+        # ---- stopped: wait out the settle, then decide ONE burst ----
+        if self.state in ("IDLE", "SETTLE"):
+            self.last_cmd = "S"
+            if self._phase_t < self.SETTLE_S:
+                return "S", self.speed
+            if abs(self.err_deg) >= self.angle_tol:
+                dur = abs(self.err_deg) / self.turn_rate
+                self._slice_s = min(max(dur, self.TURN_MIN_S), self.TURN_MAX_S)
+                self._heading_before = self._heading_now
+                self.state = "TURNING"
+                self._phase_t = 0.0
+                self.last_cmd = self._turn_cmd(self.err_deg)
+                return self.last_cmd, self._v_turn()
+            self._slice_s = self.DRIVE_S
             self.state = "DRIVING"
+            self._phase_t = 0.0
+            self.last_cmd = "F"
+            return "F", self.speed
+
+        # ---- turning burst ----
+        if self.state == "TURNING":
+            if self._phase_t >= self._slice_s:
+                # learn the real turn rate from what actually happened
+                if self._heading_before is not None and self._phase_t > 0.05:
+                    dh = abs(wrap180(self._heading_now - self._heading_before))
+                    measured = dh / self._phase_t
+                    self.turn_rate = min(max(0.3 * measured
+                                             + 0.7 * self.turn_rate,
+                                             self.RATE_MIN), self.RATE_MAX)
+                self._settle()
+                return "S", self.speed
+            self.last_cmd = self._turn_cmd(self.err_deg)
+            return self.last_cmd, self._v_turn()
+
+        # ---- driving burst ----
+        if self._phase_t >= self._slice_s:
+            self._settle()
+            return "S", self.speed
         self.last_cmd = "F"
         return "F", self.speed
 
@@ -515,8 +552,8 @@ def draw_overlay(frame, found, arena, nav):
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
 
-STATE_COLORS = {"IDLE": "#8a8a8a", "TURNING": "#e0a020", "DRIVING": "#20a0e0",
-                "ARRIVED": "#30b030", "LOST": "#d04040"}
+STATE_COLORS = {"IDLE": "#8a8a8a", "SETTLE": "#a0a0c0", "TURNING": "#e0a020",
+                "DRIVING": "#20a0e0", "ARRIVED": "#30b030", "LOST": "#d04040"}
 
 
 class VisionBotApp(ctk.CTk):
@@ -537,6 +574,7 @@ class VisionBotApp(ctk.CTk):
         self.fps, self.t_prev = 0.0, time.monotonic()
         self.last_send = 0.0
         self._v_sent = None         # last speed value pushed to the robot
+        self._last_nav_t = 0.0      # for the dt the controller receives
 
         self._build_ui()
         self.protocol("WM_DELETE_WINDOW", self._shutdown)
@@ -609,10 +647,10 @@ class VisionBotApp(ctk.CTk):
         self.stoptol_lab = row_label(panel, "Stop tolerance", r)
         self.stoptol = ctk.CTkSlider(panel, from_=5, to=20, number_of_steps=15,
                                      command=self._stoptol_changed)
-        self.stoptol.set(10)
+        self.stoptol.set(12)
         self.stoptol.grid(row=r + 1, column=0, columnspan=2, sticky="ew",
                           padx=12, pady=(0, 8))
-        self.stoptol_lab.configure(text="10 cm")
+        self.stoptol_lab.configure(text="12 cm")
         r += 2
         self.invert = ctk.CTkCheckBox(
             panel, text="Invert turn direction",
@@ -793,6 +831,12 @@ class VisionBotApp(ctk.CTk):
                 self._last_frame = frame
                 found = self.detector.detect(frame)
                 self.arena.update(found)
+                if self.arena.corner_error:
+                    self.banner.configure(
+                        text="CORNER MARKERS mirrored/swapped! 30 must be "
+                             "TOP-LEFT and 31 TOP-RIGHT as the camera sees. "
+                             "Check the taping - using ruler fallback.",
+                        text_color="#d04040")
 
                 seen_r, seen_t = ROBOT_ID in found, TARGET_ID in found
                 robot_cm = heading = target_cm = None
@@ -803,8 +847,10 @@ class VisionBotApp(ctk.CTk):
                     target_cm = self.arena.to_cm(center_of(found[TARGET_ID]))
 
                 if self.armed:
+                    dt = max(0.001, now - self._last_nav_t)
+                    self._last_nav_t = now
                     cmd, v = self.nav.step(seen_r, seen_t, robot_cm, heading,
-                                           target_cm)
+                                           target_cm, dt=dt)
 
                 draw_overlay(frame, found, self.arena, self.nav)
                 self._show(frame)
@@ -841,6 +887,7 @@ class VisionBotApp(ctk.CTk):
                 text_color="#8a8a8a")
         else:
             text = {"IDLE": "Press START (or SPACE)",
+                    "SETTLE": "LOOKING - stopped, measuring...",
                     "TURNING": f"TURNING   err {self.nav.err_deg:+.0f} deg",
                     "DRIVING": f"DRIVING   {self.nav.dist_cm:.0f} cm to card",
                     "ARRIVED": "ARRIVED - move the card to go again",
