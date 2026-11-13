@@ -440,6 +440,12 @@ class Navigator:
         self.yaw_hist.clear()          # next measurement = still frames only
         self.last_cmd = "S"
 
+    def peek(self, robot_cm, heading_deg, target_cm):
+        """Refresh the DISPLAYED dist/err without acting (robot not armed).
+        Also powers the heading-offset calibration: aim the robot at the
+        card by hand before START and read err straight off the screen."""
+        self._measure(robot_cm, heading_deg, target_cm)
+
     # ---- the decision (call every UI tick; dt = seconds since last call) --
     def step(self, seen_robot, seen_target, robot_cm, heading_deg, target_cm,
              dt=0.03):
@@ -851,6 +857,8 @@ class VisionBotApp(ctk.CTk):
                     self._last_nav_t = now
                     cmd, v = self.nav.step(seen_r, seen_t, robot_cm, heading,
                                            target_cm, dt=dt)
+                elif seen_r and seen_t:
+                    self.nav.peek(robot_cm, heading, target_cm)
 
                 draw_overlay(frame, found, self.arena, self.nav)
                 self._show(frame)
