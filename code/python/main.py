@@ -283,6 +283,9 @@ class ArenaMap:
         self.H = None                # live homography this frame
         self.last_good_H = None      # cache while a corner is hidden
         self.corner_error = None     # "mirrored" if 30-33 taped in wrong order
+        self._corner_px = None       # corner centers (px) for the PnP pose
+        self._pnp_H = None           # pose cache: recompute only when H moves
+        self._pnp_pose = None
 
     def configure(self, corner_marker_cm, cm_per_px,
                   width_override=None, height_override=None):
@@ -311,6 +314,7 @@ class ArenaMap:
                 self.H = None        # refuse the bad frame (scale fallback)
                 return
             self.corner_error = None
+            self._corner_px = centers.copy()
             sides = []
             for cid in CORNER_IDS:
                 q = found[cid].reshape(4, 2)
@@ -387,6 +391,77 @@ class ArenaMap:
                          for i in range(4)])
             sizes.append(float(s))
         return sizes
+
+    def set_frame_shape(self, w_px, h_px):
+        """Image size, needed for the parallax correction's camera model."""
+        self.frame_w_px = w_px
+        self.frame_h_px = h_px
+
+    def _camera_pose(self):
+        """Camera pose in the cm floor frame, from PnP on the four corner
+        correspondences (robust - a hand-rolled homography decomposition
+        broke on the translated dst frame). Cached until H changes."""
+        if self.last_good_H is None or not getattr(self, "frame_w_px", 0):
+            return None
+        if self._pnp_H is self.last_good_H:
+            return self._pnp_pose
+        if self._corner_px is None or len(self._corner_px) != 4:
+            return None
+        try:
+            f = (self.frame_w_px / 2.0) / math.tan(math.radians(70.0 / 2))
+            k = np.array([[f, 0, self.frame_w_px / 2.0],
+                          [0, f, self.frame_h_px / 2.0],
+                          [0, 0, 1]], dtype=np.float64)
+            obj = np.array([[0, 0, 0], [self.width_cm, 0, 0],
+                            [self.width_cm, self.height_cm, 0],
+                            [0, self.height_cm, 0]], dtype=np.float64)
+            ok, rvec, tvec = cv2.solvePnP(obj, np.array(self._corner_px,
+                                                        dtype=np.float64),
+                                          k, np.zeros(5),
+                                          flags=cv2.SOLVEPNP_IPPE)
+            if not ok:
+                return None
+            rot, _ = cv2.Rodrigues(rvec)
+            t = tvec.reshape(3)
+            c_world = -rot.T @ t
+            if not (30.0 < abs(float(c_world[2])) < 600.0):
+                return None                       # must stand well off-plane
+            self._pnp_H, self._pnp_pose = self.last_good_H, (rot, t)
+            return self._pnp_pose
+        except Exception:
+            return None
+
+    def to_cm_floor(self, p, height_cm):
+        """Position of a point floating height_cm ABOVE the floor, projected
+        to its TRUE floor position (parallax-corrected). The robot marker
+        rides ~12 cm up; without this, its apparent position shifts away
+        from the camera by h*offset/height - up to ~13 cm on our rig."""
+        plain = self.to_cm(p)
+        if height_cm <= 0 or self.last_good_H is None:
+            return plain
+        pose = self._camera_pose()
+        if pose is None:
+            return plain
+        rot, t = pose
+        f = (self.frame_w_px / 2.0) / math.tan(math.radians(70.0 / 2))
+        # ray (camera frame) through the pixel, then into the floor frame
+        d = np.array([(p[0] - self.frame_w_px / 2.0) / f,
+                      (p[1] - self.frame_h_px / 2.0) / f, 1.0])
+        d_w = rot.T @ d
+        c_world = -rot.T @ t                 # camera center, floor frame
+        cz = float(c_world[2])
+        if abs(cz) < height_cm + 5 or abs(d_w[2]) < 1e-6:
+            return plain                     # pose implausible - stay plain
+        # the marker floats toward the camera; the floor plane is z=0, so
+        # its height plane sits on the CAMERA'S side of the floor
+        side = 1.0 if cz > 0 else -1.0
+        s = (side * height_cm - cz) / d_w[2]
+        if s <= 0:
+            return plain
+        hit = c_world + s * d_w
+        if not np.isfinite(hit).all():
+            return plain
+        return (float(hit[0]), float(hit[1]))
 
     def heading_cm(self, robot_corner):
         """Robot heading in the cm frame. The marker's front direction is
@@ -730,6 +805,7 @@ class VisionBotApp(ctk.CTk):
             return var
 
         self.e_head = entry_row("Heading offset (deg)", "0", r); r += 1
+        self.e_hgt = entry_row("Robot marker h (cm)", "12", r); r += 1
         self.e_csize = entry_row("Corner marker (cm)", "6", r); r += 1
         self.e_w = entry_row("Frame W cm (empty=auto)", "", r); r += 1
         self.e_h = entry_row("Frame H cm (empty=auto)", "", r); r += 1
@@ -764,6 +840,7 @@ class VisionBotApp(ctk.CTk):
         self.nav.stop_tol = float(self.stoptol.get())
         self.nav.turn_invert = bool(self.invert.get())
         self.nav.heading_offset = self._f(self.e_head, 0.0)
+        self._robot_h = self._f(self.e_hgt, 12.0)
 
         def _opt(entry):                 # optional typed frame size, cm
             try:
@@ -794,9 +871,9 @@ class VisionBotApp(ctk.CTk):
 
     def _ruler_check(self):
         """One-press scale calibration: place the card EXACTLY 30 cm from
-        the robot marker (ruler/tape, robot near the arena centre to
-        minimise parallax), both visible on screen, then press. The corner
-        marker size is corrected so the reading becomes exactly 30 cm."""
+        the robot marker (ruler/tape, robot near the arena centre), both
+        visible on screen, then press. Corrects whichever scale definition
+        is active (typed frame size, or corner-marker size)."""
         d = self.nav.dist_cm
         if not (15.0 <= d <= 60.0):
             self.banner.configure(
@@ -804,18 +881,40 @@ class VisionBotApp(ctk.CTk):
                      "(both visible), then press again",
                 text_color="#e0a020")
             return
-        old = self.arena.corner_marker_cm
-        new = min(12.0, max(3.0, old * 30.0 / d))
-        self.e_csize.delete(0, "end")
-        self.e_csize.insert(0, f"{new:.1f}")
-        self.arena.last_scale = None          # adopt the new scale instantly
-        self._nav_params_changed()
-        print(f"[calibrate] ruler check: read {d:.1f} cm for a true 30 cm -> "
-              f"corner marker size {old:.1f} -> {new:.1f} cm")
-        self.banner.configure(
-            text=f"Scale calibrated: reads 30.0 cm now (marker size "
-                 f"{old:.1f} -> {new:.1f} cm)",
-            text_color="#30b030")
+        factor = 30.0 / d
+        if not 0.7 <= factor <= 1.45:
+            self.banner.configure(
+                text=f"Ruler check refused: reading {d:.0f} cm for a true "
+                     "30 is too far off for a scale fix - the taped quad is "
+                     "likely skewed (check the quad: line) or the robot was "
+                     "far off-centre (parallax)",
+                text_color="#d04040")
+            return
+        if self.arena.width_override:           # typed-frame mode
+            new_w = min(400.0, max(20.0, self.arena.width_override * factor))
+            new_h = min(400.0, max(20.0, self.arena.height_override * factor))
+            self.e_w.delete(0, "end"); self.e_w.insert(0, f"{new_w:.0f}")
+            self.e_h.delete(0, "end"); self.e_h.insert(0, f"{new_h:.0f}")
+            self._nav_params_changed()
+            print(f"[calibrate] ruler check (typed frame): x{factor:.2f} -> "
+                  f"{new_w:.0f} x {new_h:.0f} cm")
+            self.banner.configure(
+                text=f"Frame calibrated: {new_w:.0f} x {new_h:.0f} cm "
+                     f"(reads 30.0 now)",
+                text_color="#30b030")
+        else:                                    # marker-size mode
+            old = self.arena.corner_marker_cm
+            new = min(12.0, max(3.0, old * factor))
+            self.e_csize.delete(0, "end")
+            self.e_csize.insert(0, f"{new:.1f}")
+            self.arena.last_scale = None         # adopt the new scale fast
+            self._nav_params_changed()
+            print(f"[calibrate] ruler check: read {d:.1f} cm for a true 30 "
+                  f"-> corner marker size {old:.1f} -> {new:.1f} cm")
+            self.banner.configure(
+                text=f"Scale calibrated: reads 30.0 cm now (marker size "
+                     f"{old:.1f} -> {new:.1f} cm)",
+                text_color="#30b030")
 
     # ------------------------------------------------ control actions
     def _start(self):
@@ -932,6 +1031,7 @@ class VisionBotApp(ctk.CTk):
             if frame is not None:
                 self._last_frame = frame
                 found = self.detector.detect(frame)
+                self.arena.set_frame_shape(frame.shape[1], frame.shape[0])
                 self.arena.update(found)
                 self._corner_sizes = (self.arena.corner_sizes_cm(found)
                                       if self.arena.corner_error is None else None)
@@ -964,7 +1064,9 @@ class VisionBotApp(ctk.CTk):
                 seen_r, seen_t = ROBOT_ID in found, TARGET_ID in found
                 robot_cm = heading = target_cm = None
                 if seen_r:
-                    robot_cm = self.arena.to_cm(center_of(found[ROBOT_ID]))
+                    # parallax-corrected: the marker rides ~12 cm above floor
+                    robot_cm = self.arena.to_cm_floor(
+                        center_of(found[ROBOT_ID]), self._robot_h)
                     heading = self.arena.heading_cm(found[ROBOT_ID])
                 if seen_t:
                     target_cm = self.arena.to_cm(center_of(found[TARGET_ID]))
