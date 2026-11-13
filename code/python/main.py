@@ -73,25 +73,68 @@ def wrap180(a):
 
 # =========================================================== radio link
 class RobotLink:
-    """UDP link to the robot. Protocol (firmware src/main.cpp):
-    'F'/'B'/'L'/'R'/'S' moves, 'V<0-1023>' sets speed."""
+    """UDP link to the robot, with per-command ACKNOWLEDGEMENT.
+
+    Every command goes out with a sequence number ('F#12'); the firmware
+    replies 'A12'. ack_ok() tells whether the link is alive in BOTH
+    directions (the robot deadman only covers laptop->robot)."""
+
+    ACK_TIMEOUT_S = 0.8    # no ACK for this long = link suspect
 
     def __init__(self, ip, port):
         self.addr = (ip, port)
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.bind(("", 0))              # stable port for the ACKs
+        self.sock.setblocking(False)
         self.sent = 0
+        self._seq = 0
+        self._last_ack_seq = -1
+        self._last_ack_t = None
 
     def send(self, msg):
+        """Legacy raw send without a sequence number (no ACK expected)."""
         self.sock.sendto((msg + "\n").encode(), self.addr)
         self.sent += 1
 
+    def send_seq(self, payload):
+        """Command WITH sequence number; returns the seq used."""
+        self._seq += 1
+        self.sock.sendto((f"{payload}#{self._seq}\n").encode(), self.addr)
+        self.sent += 1
+        return self._seq
+
     def send_speed(self, v):
-        self.send(f"V{int(v)}")
+        self.send_seq(f"V{int(v)}")
+
+    def poll(self):
+        """Drain ACK packets from the socket (call every tick)."""
+        while True:
+            try:
+                data, _ = self.sock.recvfrom(64)
+            except Exception:
+                break
+            txt = data.decode(errors="ignore").strip()
+            if txt[:1] == "A":
+                try:
+                    self._last_ack_seq = int(txt[1:] or 0)
+                    self._last_ack_t = time.monotonic()
+                except ValueError:
+                    pass
+
+    @property
+    def ack_age(self):
+        if self._last_ack_t is None:
+            return None
+        return time.monotonic() - self._last_ack_t
+
+    def ack_ok(self):
+        age = self.ack_age
+        return age is not None and age < self.ACK_TIMEOUT_S
 
     def stop_burst(self, n=5):
         """A burst of STOPs so the robot parks even with packet loss."""
         for _ in range(n):
-            self.send("S")
+            self.send_seq("S")
             time.sleep(0.03)
 
     def close(self):
@@ -506,10 +549,14 @@ class Navigator:
         self.speed = 400            # 0..1023, drive speed (slider)
         self.angle_tol = 25.0       # deg - re-aim if the error is past this
         self.stop_tol = 12.0        # cm - within this, arrived
+        self.turn_step_deg = 30.0   # max degrees per turn step
+        self.drive_step_cm = 10.0   # max cm per drive step
         self.turn_invert = False    # flip turn direction if it turns AWAY
         self.heading_offset = 0.0   # deg - fixes a marker taped slightly off
         self.turn_rate = self.RATE0 # learned during the run
         self.drive_speed = 15.0     # cm/s - learned during the run
+        self.turn_steps = 0         # step counters (shown in the banner)
+        self.drive_steps = 0
         self.reset()
 
     def reset(self):
@@ -649,6 +696,8 @@ class Navigator:
                 dur = (a - short) / self.turn_rate
                 if a > 150.0:
                     dur = min(dur, 0.5)     # approach the back axis in steps
+                # degree stepping: one step is never more than turn_step_deg
+                dur = min(dur, self.turn_step_deg / self.turn_rate)
                 self._slice_s = min(max(dur, self.TURN_MIN_S), self.TURN_MAX_S)
                 self._pend = ("turn", self._heading_now)
                 self._move_t = 0.0
@@ -661,15 +710,19 @@ class Navigator:
                 self._turn_dir = cmd
                 self.state = "TURNING"
                 self._phase_t = 0.0
+                self.turn_steps += 1
                 self.last_cmd = cmd
                 return cmd, self._v_turn()
-            # drive burst sized to END at the tolerance edge (learned speed)
+            # drive burst sized to END at the tolerance edge (learned speed),
+            # but never longer than one drive step (cm)
             dur = (self.dist_cm - 0.7 * self.stop_tol) / self.drive_speed
+            dur = min(dur, self.drive_step_cm / self.drive_speed)
             self._slice_s = min(max(dur, 0.2), self.DRIVE_S)
             self._pend = ("drive", robot_cm)
             self._move_t = 0.0
             self.state = "DRIVING"
             self._phase_t = 0.0
+            self.drive_steps += 1
             self.last_cmd = "F"
             return "F", self.speed
 
@@ -865,6 +918,8 @@ class VisionBotApp(ctk.CTk):
 
         self.e_head = entry_row("Heading offset (deg)", "0", r); r += 1
         self.e_hgt = entry_row("Robot marker h (cm)", "12", r); r += 1
+        self.e_tstep = entry_row("Turn step (deg)", "30", r); r += 1
+        self.e_dstep = entry_row("Drive step (cm)", "10", r); r += 1
         self.e_csize = entry_row("Corner marker (cm)", "6", r); r += 1
         self.e_w = entry_row("Frame W cm (empty=auto)", "", r); r += 1
         self.e_h = entry_row("Frame H cm (empty=auto)", "", r); r += 1
@@ -897,6 +952,8 @@ class VisionBotApp(ctk.CTk):
             data = {"speed": int(self.speed.get()),
                     "angle_tol": int(self.angle.get()),
                     "stop_tol": int(self.stoptol.get()),
+                    "turn_step": self.e_tstep.get(),
+                    "drive_step": self.e_dstep.get(),
                     "invert": bool(self.invert.get()),
                     "heading_offset": self.e_head.get(),
                     "robot_h": self.e_hgt.get(),
@@ -922,6 +979,8 @@ class VisionBotApp(ctk.CTk):
 
         for entry, key in ((self.e_head, "heading_offset"),
                            (self.e_hgt, "robot_h"),
+                           (self.e_tstep, "turn_step"),
+                           (self.e_dstep, "drive_step"),
                            (self.e_csize, "corner_cm"),
                            (self.e_w, "frame_w"), (self.e_h, "frame_h"),
                            (self.e_scale, "cm_per_px"), (self.e_ip, "ip")):
@@ -957,6 +1016,8 @@ class VisionBotApp(ctk.CTk):
         self.nav.turn_invert = bool(self.invert.get())
         self.nav.heading_offset = self._f(self.e_head, 0.0)
         self._robot_h = self._f(self.e_hgt, 12.0)
+        self.nav.turn_step_deg = min(90.0, max(5.0, self._f(self.e_tstep, 30.0)))
+        self.nav.drive_step_cm = min(40.0, max(3.0, self._f(self.e_dstep, 10.0)))
 
         def _opt(entry):                 # optional typed frame size, cm
             try:
@@ -1203,13 +1264,26 @@ class VisionBotApp(ctk.CTk):
         self._update_readout(cmd)
         # send at SEND_HZ while armed (the keepalive feeds the robot deadman);
         # V goes out only when the desired speed actually changes
+        if self.link is not None:
+            self.link.poll()
         if self.armed and self.link and cmd is not None and \
                 now - self.last_send >= 1.0 / SEND_HZ:
-            self.link.send(cmd)
+            self.link.send_seq(cmd)
             if v is not None and v != self._v_sent:
-                self.link.send_speed(v)
+                self.link.send_seq(f"V{v}")
                 self._v_sent = v
             self.last_send = now
+            # bidirectional check: no ACK while running = pause safely
+            if self.link.sent > 3 and not self.link.ack_ok():
+                self._ack_lost_at = getattr(self, "_ack_lost_at", None) or now
+                if now - self._ack_lost_at > 1.0:
+                    self._pause()
+                    self.banner.configure(
+                        text="ROBOT NOT ACKNOWLEDGING - paused. Check robot "
+                             "power / Wi-Fi, then START again.",
+                        text_color="#d04040")
+            else:
+                self._ack_lost_at = None
 
         self._after_id = self.after(30, self._tick)
 
@@ -1233,8 +1307,10 @@ class VisionBotApp(ctk.CTk):
         else:
             text = {"IDLE": "Press START (or SPACE)",
                     "SETTLE": "LOOKING - stopped, measuring...",
-                    "TURNING": f"TURNING   err {self.nav.err_deg:+.0f} deg",
-                    "DRIVING": f"DRIVING   {self.nav.dist_cm:.0f} cm to card",
+                    "TURNING": f"TURN step {self.nav.turn_steps} "
+                               f"(err {self.nav.err_deg:+.0f} deg)",
+                    "DRIVING": f"DRIVE step {self.nav.drive_steps} "
+                               f"({self.nav.dist_cm:.0f} cm to card)",
                     "ARRIVED": "ARRIVED - move the card to go again",
                     "LOST": "MARKER LOST - stopped (waiting to see both)"}.get(st, st)
             self.banner.configure(text=text, text_color=color)
@@ -1258,14 +1334,20 @@ class VisionBotApp(ctk.CTk):
                     "/".join(f"{s:.1f}" for s in self._corner_sizes) + " cm"
                     if self._corner_sizes else
                     "green = corrected rectangle, white = as taped")
+        if self.link is not None:
+            ack_txt = (f"ACK {self.link.ack_age * 1000:.0f} ms OK"
+                       if self.link.ack_ok() else "ACK LOST")
+        else:
+            ack_txt = "no link"
         lines = [
             f"state   : {st:<8} cmd {cmd or '-'}   speed {int(self.speed.get())}%",
+            f"steps   : {self.nav.turn_steps} turn / {self.nav.drive_steps} drive",
             f"arena   : {arena_txt}",
             f"quad    : {quad_txt}",
             f"dist    : {self.nav.dist_cm:6.1f} cm   err {self.nav.err_deg:+6.1f} deg",
             f"tol     : {self.nav.angle_tol:.0f} deg / {self.nav.stop_tol:.0f} cm"
             f"   turn invert {'ON' if self.nav.turn_invert else 'off'}",
-            f"radio   : {self.link.sent if self.link else 0} packets"
+            f"radio   : {self.link.sent if self.link else 0} pkt   {ack_txt}"
             f"   {self.cam_info}   {self.fps:.0f} fps",
         ]
         self.readout.delete("1.0", "end")

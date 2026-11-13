@@ -9,9 +9,11 @@
 // (the laptop loses internet while joined — expected) and runs
 // code/python/drive_test.py: W/A/S/D drive, SPACE stop, +/- speed, ESC quit.
 //
-// Commands arrive over UDP 10x per second. If they stop for 600 ms the
-// robot stops BY ITSELF (deadman) — switching off laptop Wi-Fi mid-drive
-// must stop the robot. Test it, it's a fun one.
+// Commands arrive over UDP 10x per second, each with a sequence number
+// ("F#12", "R#13", "V400#14") and are ACKNOWLEDGED back to the sender
+// ("A12") - bidirectional radio, so the laptop can tell a live link from
+// a dead one. Plain commands without "#n" (drive_test.py) still work.
+// If commands stop for 600 ms the robot stops BY ITSELF (deadman).
 
 // ---- pins (same wiring as the motor test) ----
 #define ENA D1   // left motor speed  (PWM)
@@ -107,17 +109,30 @@ void loop() {
   // ---- receive commands ----
   int packetSize = udp.parsePacket();
   if (packetSize) {
-    char buf[16];
+    char buf[24];
     int n = udp.read(buf, sizeof(buf) - 1);
     if (n > 0) {
-      buf[n] = 0;                  // zero-terminate
-      if (buf[0] == 'V') {         // "V412" = set speed
+      buf[n] = 0;                    // zero-terminate
+      long seq = -1;
+      char *hash = strchr(buf, '#'); // optional "#seq" suffix
+      if (hash) {
+        seq = atol(hash + 1);
+        *hash = 0;                   // strip it, leaving the bare command
+      }
+      if (buf[0] == 'V') {           // "V412" = set speed
         int v = atoi(buf + 1);
         driveSpeed = constrain(v, 0, 1023);
-        applyCommand(lastState);   // re-apply current move at the new speed
+        applyCommand(lastState);     // re-apply current move at the new speed
         Serial.printf("[speed] %d/1023 (%d%%)\n", driveSpeed, driveSpeed * 100 / 1023);
       } else {
-        applyCommand(buf[0]);      // F B L R S
+        applyCommand(buf[0]);        // F B L R S
+      }
+      if (seq >= 0) {                // acknowledge back to the sender
+        char ack[12];
+        int al = snprintf(ack, sizeof(ack), "A%ld", seq);
+        udp.beginPacket(udp.remoteIP(), udp.remotePort());
+        udp.write((const uint8_t *)ack, al);
+        udp.endPacket();
       }
     }
     lastCmdMs = millis();
