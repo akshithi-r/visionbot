@@ -350,6 +350,34 @@ class ArenaMap:
         s = self.last_scale if self.last_scale else self.cm_per_px
         return (float(p[0]) * s, float(p[1]) * s)
 
+    def image_from_cm(self, pts_cm):
+        """Map cm-frame points back into image pixels (for drawing)."""
+        if self.last_good_H is None:
+            return None
+        h_inv = np.linalg.inv(self.last_good_H)
+        pts = np.array(pts_cm, dtype=np.float32).reshape(-1, 1, 2)
+        return cv2.perspectiveTransform(pts, h_inv).reshape(-1, 2)
+
+    def corner_sizes_cm(self, found):
+        """Each corner marker's side length MAPPED into the cm frame.
+
+        All four should read ~ the printed size (6 cm). A big spread means
+        the taped quad is not a physical rectangle (or a corner moved) -
+        and the mapping is warped, so distances read wrong per position."""
+        if self.last_good_H is None:
+            return None
+        sizes = []
+        for cid in CORNER_IDS:
+            if cid not in found:
+                return None
+            q = found[cid].reshape(4, 2).astype(np.float32)
+            cm = cv2.perspectiveTransform(
+                q.reshape(-1, 1, 2), self.last_good_H).reshape(4, 2)
+            s = np.mean([np.linalg.norm(cm[(i + 1) % 4] - cm[i])
+                         for i in range(4)])
+            sizes.append(float(s))
+        return sizes
+
     def heading_cm(self, robot_corner):
         """Robot heading in the cm frame. The marker's front direction is
         mapped through the homography too, so a rotated/upscaled camera is
@@ -530,6 +558,23 @@ def draw_overlay(frame, found, arena, nav):
             cv2.putText(frame, str(cid), (pts[0][0], pts[0][1] - 8),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, C_CORNER, 2)
 
+    # ---- arena geometry: raw taped quad vs the corrected cm rectangle ----
+    if arena.last_good_H is not None:
+        w_cm, h_cm = arena.width_cm, arena.height_cm
+        rect = arena.image_from_cm([(0, 0), (w_cm, 0),
+                                    (w_cm, h_cm), (0, h_cm)]).astype(int)
+        cv2.polylines(frame, [rect], True, (60, 220, 60), 3)   # corrected
+        centers = [center_of(found[cid]) for cid in CORNER_IDS if cid in found]
+        if len(centers) == 4:
+            cv2.polylines(frame, [np.array(centers, dtype=int)], True,
+                          (255, 255, 255), 2)                  # as taped
+        for gx in range(20, int(w_cm), 20):                     # 20 cm grid
+            ln = arena.image_from_cm([(gx, 0), (gx, h_cm)]).astype(int)
+            cv2.line(frame, tuple(ln[0]), tuple(ln[1]), (200, 200, 200), 1)
+        for gy in range(20, int(h_cm), 20):
+            ln = arena.image_from_cm([(0, gy), (w_cm, gy)]).astype(int)
+            cv2.line(frame, tuple(ln[0]), tuple(ln[1]), (200, 200, 200), 1)
+
     for marker_id, color in ((ROBOT_ID, C_ROBOT), (TARGET_ID, C_TARGET)):
         if marker_id in found:
             pts = found[marker_id].reshape(4, 2).astype(int)
@@ -581,6 +626,7 @@ class VisionBotApp(ctk.CTk):
         self.last_send = 0.0
         self._v_sent = None         # last speed value pushed to the robot
         self._last_nav_t = 0.0      # for the dt the controller receives
+        self._corner_sizes = None   # per-corner mapped size (taping health)
 
         self._build_ui()
         self.protocol("WM_DELETE_WINDOW", self._shutdown)
@@ -837,12 +883,23 @@ class VisionBotApp(ctk.CTk):
                 self._last_frame = frame
                 found = self.detector.detect(frame)
                 self.arena.update(found)
+                self._corner_sizes = (self.arena.corner_sizes_cm(found)
+                                      if self.arena.corner_error is None else None)
                 if self.arena.corner_error:
                     self.banner.configure(
                         text="CORNER MARKERS mirrored/swapped! 30 must be "
                              "TOP-LEFT and 31 TOP-RIGHT as the camera sees. "
                              "Check the taping - using ruler fallback.",
                         text_color="#d04040")
+                elif self._corner_sizes and \
+                        max(self._corner_sizes) - min(self._corner_sizes) > 1.0:
+                    self.banner.configure(
+                        text="Corner taping not a true rectangle (marker sizes "
+                             "read " + "/".join(f"{s:.1f}" for s in
+                                                self._corner_sizes) +
+                             " cm) - re-tape: equal DIAGONALS, then rerun the "
+                             "30 cm check",
+                        text_color="#e0a020")
 
                 seen_r, seen_t = ROBOT_ID in found, TARGET_ID in found
                 robot_cm = heading = target_cm = None
@@ -911,9 +968,14 @@ class VisionBotApp(ctk.CTk):
             arena_txt = "marker-derived scale (cached)"
         else:
             arena_txt = "RULER SCALE (no corners seen)"
+        quad_txt = ("corner sizes " +
+                    "/".join(f"{s:.1f}" for s in self._corner_sizes) + " cm"
+                    if self._corner_sizes else
+                    "green = corrected rectangle, white = as taped")
         lines = [
             f"state   : {st:<8} cmd {cmd or '-'}   speed {int(self.speed.get())}%",
             f"arena   : {arena_txt}",
+            f"quad    : {quad_txt}",
             f"dist    : {self.nav.dist_cm:6.1f} cm   err {self.nav.err_deg:+6.1f} deg",
             f"tol     : {self.nav.angle_tol:.0f} deg / {self.nav.stop_tol:.0f} cm"
             f"   turn invert {'ON' if self.nav.turn_invert else 'off'}",
