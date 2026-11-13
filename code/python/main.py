@@ -532,6 +532,11 @@ class Navigator:
     decision comes from a still, sharp image. Turn bursts self-calibrate:
     each burst measures how much the heading really changed, so the app
     learns the robot's true turn rate (deg/s) within a few bursts.
+
+    Bursts are TIMED PULSES executed by the firmware ("R150" = turn right
+    for 150 ms, self-stopped on board): the laptop sends the pulse once,
+    streams "K" keepalives while it runs, then settles and measures - so
+    burst length is exact no matter what the Wi-Fi or send slots do.
     """
 
     SETTLE_S = 0.35      # stopped time before measuring (motion blur dies)
@@ -608,14 +613,13 @@ class Navigator:
 
     def _learn_from_pend(self, robot_cm):
         """Learn turn rate / drive speed from SETTLED-to-settled measurements
-        (both ends still), divided by the time actually spent MOVING - the
-        settle pause must not dilute the rate, and mid-motion readings read
-        low (the smoothed heading lags while rotating), which made every
-        burst overshoot."""
+        (both ends still), divided by the COMMANDED pulse length - the
+        firmware executes it exactly, so dt needs no estimate, the settle
+        pause can't dilute it, and mid-motion lag can't skew it."""
         if not self._pend:
             return
         kind, before = self._pend
-        dt = self._move_t
+        dt = self._slice_s              # exact: timed on the firmware
         self._pend = None
         if dt < 0.15:
             return
@@ -656,7 +660,9 @@ class Navigator:
                 self.state = "LOST"
                 self._pend = None
                 self.last_cmd = "S"
-            return self.last_cmd, self.speed
+            # last_cmd is "K" while a pulse runs: a dropped frame must
+            # never re-send (and so RESTART) a timed pulse
+            return self.last_cmd, None
         self.miss = 0
         self._phase_t += dt
         self._t_accum += dt
@@ -711,8 +717,8 @@ class Navigator:
                 self.state = "TURNING"
                 self._phase_t = 0.0
                 self.turn_steps += 1
-                self.last_cmd = cmd
-                return cmd, self._v_turn()
+                self.last_cmd = "K"     # replay-safe: never restart a pulse
+                return f"{cmd}{round(self._slice_s * 1000)}", self._v_turn()
             # drive burst sized to END at the tolerance edge (learned speed),
             # but never longer than one drive step (cm)
             dur = (self.dist_cm - 0.7 * self.stop_tol) / self.drive_speed
@@ -723,24 +729,23 @@ class Navigator:
             self.state = "DRIVING"
             self._phase_t = 0.0
             self.drive_steps += 1
-            self.last_cmd = "F"
-            return "F", self.speed
+            self.last_cmd = "K"     # replay-safe: never restart a pulse
+            return f"F{round(self._slice_s * 1000)}", self.speed
 
-        # ---- turning burst ----
+        # ---- turning pulse: the FIRMWARE runs it; we only feed the link ----
         if self.state == "TURNING":
             if self._phase_t >= self._slice_s:
-                self._settle()
+                self._settle()       # S confirms the on-board stop
                 return "S", self.speed
-            self.last_cmd = self._turn_dir or self._turn_cmd(self.err_deg)
-            return self.last_cmd, self._v_turn()
+            return "K", None
 
-        # ---- driving burst: straight, bail out early if the aim blows ----
+        # ---- driving pulse: firmware runs it; bail out early if the aim
+        # blows (S cancels the pulse on the spot) ----
         if self._phase_t >= self._slice_s or \
                 abs(self.err_deg) > 0.8 * self.angle_tol:
             self._settle()
             return "S", self.speed
-        self.last_cmd = "F"
-        return "F", self.speed
+        return "K", None
 
 
 # =========================================================== overlay
@@ -1263,15 +1268,19 @@ class VisionBotApp(ctk.CTk):
 
         self._update_readout(cmd)
         # send at SEND_HZ while armed (the keepalive feeds the robot deadman);
-        # V goes out only when the desired speed actually changes
+        # V goes out only when the desired speed actually changes. A timed
+        # pulse ("R150") is ONE-SHOT: fire it the moment it's decided, not
+        # at the next send slot - and only AFTER any pending speed change,
+        # so the pulse never runs at a stale PWM.
         if self.link is not None:
             self.link.poll()
+        pulse = cmd is not None and len(cmd) > 1
         if self.armed and self.link and cmd is not None and \
-                now - self.last_send >= 1.0 / SEND_HZ:
-            self.link.send_seq(cmd)
+                (pulse or now - self.last_send >= 1.0 / SEND_HZ):
             if v is not None and v != self._v_sent:
                 self.link.send_seq(f"V{v}")
                 self._v_sent = v
+            self.link.send_seq(cmd)
             self.last_send = now
             # bidirectional check: no ACK while running = pause safely
             if self.link.sent > 3 and not self.link.ack_ok():

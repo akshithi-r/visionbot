@@ -438,3 +438,196 @@ Regressions re-verified: arrived latch/resume, hold-3-frames-then-stop, invert +
 **Verification:** 8 headless checks on synthetic 6-marker frames — auto-scale accuracy, heading exactness, proportional speeds (400 vs 191), hysteresis sequence (turn at 90/40/20 → commit at 10 → hold at 20 → re-turn at 30), pulse pattern, latches, fallbacks, GUI smoke with the new entry. Committed as `cbea732` on branch `nav-autoscale-control` (main untouched for easy A/B).
 
 **Live test on the branch:** same three-step ladder (straight 30 cm → card behind → 5 spots). Expect: TURNING slows down as it closes on the line, one committed straight run with gentle nudges, ARRIVED. Speed slider = drive speed; turn speed is automatic.
+
+---
+
+## 2026-11-13 — Branch round 2: stall floor, scale smoothing, parallax Q&A
+
+**Field observations after round 1 ("little bit better"):**
+1. *Robot marker sits ~12 cm up, card flat on floor — problem?* → Parallax, yes: the elevated marker reads shifted away from the camera's nadir by ≈ height × off-center distance ÷ camera height (~6 cm worst case at H=120). It biases the STOP POINT, not the heading. Mitigation: mount the plate lower if possible, stop tolerance 12–15 cm, camera high. Card is 12 cm wide → still lands on the card.
+2. *Left wheel not rotating while turning + humming, robot not moving* → NOT intended: my proportional turn speed floor (15% PWM) was below the drivetrain's stall point (L298N ~2 V drop + alkaline sag) — motors energized but stalled; the freer wheel moved alone. **Fix: turn speed now 65–100% of the drive speed (floor 250/1023).** Verified monotonic, never below floor.
+3. *Take corner positions ONCE at START?* → Kept per-frame on purpose (START-locked homography navigates wrong if a visitor bumps the rig mid-demo, with no healing). The real concern — per-frame jitter of the derived scale — fixed with **EMA smoothing (α=0.25)**: ±1% input jitter → 0.34% output spread, a real +5% change still tracked within 30 frames.
+
+**Verification:** floor tests at slider 30/40/60%; TURNING command carries both wheels ≥ floor; EMA tracking + jitter; hysteresis/latch regressions; GUI smoke. Commit `8038a58` on `nav-autoscale-control`.
+
+**Next:** same live ladder. Watch for: turning now always spins BOTH wheels; near-aim turns are brisker than before (that's the stall floor, working).
+
+---
+
+## 2026-11-13 — Branch round 3: motor band calibrated — 25–40% usable
+
+**Field measurement (the kid's, worth a logbook line of its own):** below ~25% PWM the wheels don't turn at all; above ~40% the robot is too fast. Usable band: **25–40%**.
+
+**Changes (commit `cac77b6`):**
+- Turn speed now uses ABSOLUTE PWM bounds — floor **300/1023 ≈ 29%** (safely above stall) up to the slider value. Previously the floor was a fraction of the slider, so dragging the slider below ~38% sank the turn floor below stall (humming, one wheel stopped).
+- Speed slider: minimum raised 10% → **25%** (below that the motors physically don't move — no point offering it), default **35%** (comfortably inside the band).
+
+**Verification:** at slider 25/28/35/40/60/100% the turn speed stays within [29%, slider%], monotonic in error; at slider 25% turning still commands ≥300 PWM; TURNING decision carries the floor; GUI slider default + live change OK.
+
+**Numbers we used:** stall ≈ 25% · too-fast ≈ 40% · turn floor 300/1023 · default drive 35%. *(These numbers are battery-dependent — with the 6×NiMH 7.2V exhibition pack the whole band shifts up in voltage; re-check the stall point once.)*
+
+**Next:** the ladder again — with turns guaranteed inside the motor band this time.
+
+---
+
+## 2026-11-13 — Branch round 4: step-then-look + corner-mirror detection
+
+**Field report:** physical arena 58 × 116 cm reads W47 × H87; robot not stopping, turning to target randomly.
+
+**Diagnosis (three separate things):**
+1. *Scale shrink ~0.78× on both axes* → suspected the printed corner markers were larger than the 6 cm assumption. **Clarified:** the size to enter/measure is the BLACK BOX only (outer edge of the black square — exactly what the detector's bounding box encloses; the white quiet border never counts). Black box = 6 cm confirmed → the W47×H87 vs 58×116 gap is just **markers taped inset from the board edges** (W/H shows marker-center-to-marker-center) — harmless, navigation never uses board size. **Definitive calibration test: robot + card exactly 30 cm apart must read ≈30 cm on screen; if it reads ~24, raise "Corner marker (cm)" until 30 reads 30.**
+2. *Random turning + never stopping* → classic **mirrored corner taping** (two corners swapped as the camera sees them): the homography flips the navigation frame, bearings/headings become garbage.
+3. General control robustness → the kid's own proposal: **acknowledge the feedback before every few steps.**
+
+**Changes (commit `efad402`):**
+- **Step-then-look controller**: every move is a short burst (turn 0.15–0.9 s / drive 0.7 s) → STOP → 0.35 s settle → measure from a STILL frame → decide the next burst. Turn-burst length **self-calibrates** — the app measures how much the heading actually changed per burst and learns the robot's true °/s. Banner shows "LOOKING — stopped, measuring" between bursts.
+- **Corner-mirror auto-detection**: shoelace orientation check on 30→31→32→33 every frame; a mirrored taping now produces a red banner ("check the taping — using ruler fallback") and refuses the bad homography (ruler-scale nav stays geometrically true) instead of navigating a flipped frame.
+- Stop tolerance default 12 cm (matches the ~12 cm marker-height parallax).
+
+**Verification:** virtual-robot closed-loop simulation (turn rate 100°/s, drive 15 cm/s) → ARRIVED in 6.3 s, consistent turn direction (no flipping), learned rate 91°/s vs true 100, ≥3 stop-and-look pauses; mirrored fixture detected → fallback; mid-run stop at 11.8 cm ≤ tol 12; dropout hold×3 → STOP → recovery re-settles before moving.
+
+**Next:** ruler the corner marker → fix the "Corner marker (cm)" entry; re-check corner ORDER (robot near 30 appears top-left); run the ladder. The robot should now visibly move-stop-move — deliberate steps.
+
+---
+
+## 2026-11-13 — UI fix: live distance before START (was "0 cm")
+
+**Question:** why does the UI show 0 cm before the robot is powered on? **Answer:** nothing to do with the robot's power — the marker is passive paper, the camera sees it either way. The 0 was a display artifact: dist/err were computed by the Navigator, which only runs while armed, so before START they showed their initial 0.
+
+**Fix (commit `edba417`):** `peek()` refreshes the displayed distance/error every frame with both markers visible — no commands, no state machine. Bonus: the **heading-offset calibration is now readable pre-START** (aim the robot at the card by hand, read err off the screen, type it into Heading offset). Verified: peek updates dist 30→60 cm and err 0→+79° while state stays IDLE and no command is issued.
+
+---
+
+## 2026-11-13 — Arena diagnostics: position-dependent distance error explained + overlay
+
+**Field report:** card at true 30 cm reads 27; at true 60 cm reads **37**. Different error factors (0.90 vs 0.62) = position-dependent warp. Also: the corner-marker quad looks like a trapezoid in the image (top closer than bottom).
+
+**Diagnosis:** the image trapezoid itself is fine — that is ordinary perspective, which the homography removes. The non-uniform distance error means the **four taped markers do not form a true physical rectangle** (taped by eye / bumped). Force-fitting a rectangle onto a skewed quad warps distances differently per region. Reproduced headlessly: a quad with top edge physically shorter reads the SAME segment −16% in one region while a rectangular quad reads it true (20.2 vs 20.0 cm).
+
+**Changes (commit `f7513db`):**
+- Overlay now draws the **corrected cm rectangle (green)** + the **raw taped quad (white)** + a light 20 cm grid — if taping is rectangular the green box passes exactly through the four marker centers.
+- **Per-corner size readout**: each corner marker's side mapped into the cm frame — all four should read ~6.0 cm. A spread >1 cm triggers an amber banner: *"Corner taping not a true rectangle … re-tape: equal DIAGONALS, then rerun the 30 cm check"* with the four numbers.
+
+**Advice on the black-chart border idea: REJECTED for this project** — edge-detected borders are lighting-fragile (glare at the venue), and a black border eats the white quiet zone ArUco markers need. The "fixed known size" goal is achieved by taping the four markers as a measured rectangle instead.
+
+**Re-tape procedure (2 minutes):** place the four markers at the corners of a true rectangle — check with a tape measure that **both diagonals are equal** (that IS the rectangle test), sides parallel to the board edges. Then on screen: green box through all four centers, corner sizes all ~6.0, and the 30 cm ruler check reads ≈30 **in two different places** (center + a far corner).
+
+**Next:** re-tape → overlay + 30 cm double check → ladder run.
+
+---
+
+## 2026-11-13 — Ruler-calibration button + what the green box proves
+
+**Field report:** green box passes through the corner-marker centers, but the grid shows ~2.25×4.5 cells of 20 cm instead of the expected 3×6 on a 60×120 arena (app reads W47×H87).
+
+**Clarification:** the green rectangle passing through the four centers is *guaranteed by construction* — it is fitted through them, so it is NOT evidence of rectangular taping. The taping/quality arbiters are the `quad:` per-corner sizes and the 30 cm ruler test. A small W/H has exactly two possible causes: (a) markers taped inside the board edges — frame is the marker rectangle, everything correct, grid legitimately smaller; (b) wrong scale (printed markers ≠ 6 cm) — all cm readings uniformly small.
+
+**Change (commit `6fdf3e0`):** **"Ruler check: card 30 cm from robot" button** — place the card exactly 30 cm from the robot marker (robot near arena centre to minimise parallax), both visible, press once: the corner-marker size is auto-corrected so the reading becomes exactly 30 cm (clamped 3–12, scale re-derived instantly). Out-of-range readings get guidance instead. Verified: 23.4 cm reading → marker size 6.0→7.7 → reads 30.0 next frame; guards + clamp OK.
+
+**Decision tree for the user:** 30 cm test reads ≈30 → scale TRUE, W/H small just means markers are inset — tape them at the extreme corners of the 60×120 board if you want the 3×6 grid over the whole arena. Reads <30 → press the button, done (it also computes the effective marker size — log the number).
+
+**Next:** ruler check → (optionally) move markers to the extreme corners → grid 3×6 → ladder run.
+
+---
+
+## 2026-11-13 — Typed frame size: the trapezoid→rectangle mapping in true cm
+
+**User request:** type the rectangle size so the trapezoid→rectangle calculation uses it. **Answer: yes, it works** — if the four taped markers physically form a true rectangle, typing its true size makes the homography map the camera trapezoid onto that exact rectangle, and all positions/distances come out in **exact true cm** — the printed marker size becomes irrelevant for scale.
+
+**Change (commit `4e3ed87`):** "Frame W/H cm (empty=auto)" entries. Empty = marker-derived auto scale (previous behaviour). Typed = override, and the readout shows `corners TYPED 60 x 120 (auto 47 x 87)`.
+
+**The two traps, both guarded:**
+1. Typed size must be the **marker-center-to-marker-center** distances — NOT the board edges. Typing the board while markers are inset inflates all cm readings by the mismatch (verified: typing 1.4× true scales a 20 cm segment to 28 cm). Guard: amber banner when typed differs >15% from marker-derived.
+2. Typing doesn't un-skew a skewed quad — equal-diagonals taping still required (`quad:` line keeps checking).
+
+**Cross-check bonus:** with the true frame typed, the `quad:` per-corner line reveals the markers' **real printed size** (fixture: reads 5.95 ≈ 6.0 true print) — if it reads ~7.7 uniformly, that's the actual print size, worth logging.
+
+**Procedure:** tape-measure center-to-center width + height → type both → banner must NOT complain → 30 cm ruler test reads ≈30 → done. Grid then shows the true cell count over the marker rectangle.
+
+**Next:** measure + type the frame → verify 30 cm → ladder run.
+
+---
+
+## 2026-11-13 — The 17 cm mystery solved: marker-height parallax, now CORRECTED
+
+**Field report:** card 30 cm from the robot reads **17 cm**, frame typed 60×120.
+
+**Diagnosis:** with a true frame typed, a −43% distance error can't be scale — it's the **12 cm marker-height parallax at its worst**: the elevated robot marker appears shifted away from the camera; with the robot far from the camera's nadir and the card beyond it, the shift subtracts ~13 cm from the measured distance. This also retroactively explains the whole day's pattern (30→27, 60→37, position-dependent errors). **Plus a real bug found:** the ruler-check button was a silent no-op in typed-frame mode (it corrected marker size, which typed mode ignores).
+
+**Fixes (commit `a8311cc`):**
+1. **Parallax correction**: camera pose recovered per homography via `cv2.solvePnP` on the four corner correspondences (approximate C920 intrinsics, hfov 70°); the robot's floor position = the camera→pixel ray intersected with the **z = marker-height plane**. New entry: "Robot marker h (cm)" (default 12). (First attempt — hand-rolled homography decomposition — produced garbage on the translated dst frame and was replaced by PnP; a good debugging story for judges.)
+2. **Ruler button**: in typed mode it now scales the TYPED frame (was: no-op); corrections outside 0.7–1.45× are refused with a "geometry suspect" banner instead of writing absurd sizes.
+
+**Verification (synthetic 3D camera, known ground truth):** mid-arena position error 4.0 cm → **0.1 cm**; worst far-corner 6.3 cm → **0.1 cm**; near nadir 0.4 → 0.1; camera center recovered within cm; nav closed-loop regression still converges; GUI smoke clean. Test-fixture lessons logged: synthetic markers must be pasted at their true projected size; corner labels must be assigned as the camera sees them (the mirror detector correctly flagged a mislabeled fixture).
+
+**Expected after this:** the 30 cm test should read ≈30 **anywhere** in the arena (not just near the centre); the stop point should no longer drift with robot position.
+
+**Next:** rerun the 30 cm test in 2–3 spots (all ≈30), then the ladder.
+
+---
+
+## 2026-11-13 — Back-axis circling fixed + calibration now persists
+
+**Field report:** with the target roughly BEHIND the robot at START, it kept rotating full circles instead of a small turn. (User hypothesis: opposite-wheel spins create too much rotation — half right, see below.) Also: frame W/H + marker sizes should not need re-typing every launch.
+
+**Circling diagnosis — the ±180° trap:** with the target behind, err sits near ±180 where its SIGN flickers with every bit of measurement noise; the controller re-chose the turn direction from that sign every burst → direction flip-flop + fast differential spins + long bursts = endless circles. Fix (commit `720b565`): **commit to one turn direction while |err| > 150°** (both directions are equally short there — consistency wins), **aim 5° short** of the line (no overshooting through the axis), and **cap back-axis bursts at 0.5 s**. Simulated with 180–200°/s physical spin + 3–4° noise: converges to ARRIVED with a single committed direction. The genuinely fast differential spin the kid noticed is real — burst sizing is what keeps it in check.
+
+**Settings persistence:** all calibration (frame W/H, corner-marker cm, robot height, heading offset, invert, speed/tolerances, IP) now saves to `nav_settings.json` (gitignored) on START / PAUSE / quit and loads at launch — including slider→navigator propagation (programmatic `.set()` doesn't fire CTk commands; the load path calls the handlers explicitly). Verified round-trip across app restarts. Also: `_tick` after-callback cancelled on shutdown.
+
+**Noted with satisfaction:** the user confirmed the grid overlay reads exactly 20×20 cm cells and aligns with the camera trapezoid — the corrected mapping doing its job visually.
+
+**Next:** START with the card behind the robot (should now turn the short committed way), 30 cm test in 2–3 spots, then the ladder → 5-in-a-row.
+
+---
+
+## 2026-11-13 — Latency-tolerant burst control (turn/stop overshoot + arena overrun)
+
+**Field report:** grid now correct (mapping confirmed good ✓), but: turns overshoot ("keeps turning too much instead of a step turn"), stopping overshoots, the robot leaves the arena bounding box, and drives go cross-wise instead of straight. User hypothesis: feedback/controller not in sync, high latency — essentially correct.
+
+**Root causes (three real bugs of mine):**
+1. **Rate learning was biased low** — it measured heading change at burst-end *mid-motion* (the smoothed heading lags 2–3 frames while rotating) AND divided by wall time that included the 0.35 s motionless settle. Learned rate ≈30% low → every burst sized too long → systematic overshoot on every turn. **Fix: settled-to-settled measurements, divided by MOTION time only.**
+2. **Drive bursts were a fixed 0.7 s** ≈ 10–14 cm — larger than the whole 12 cm stop tolerance, so the robot leapt across the target zone. **Fix: drive speed (cm/s) is now learned too, and each burst is sized to END at the tolerance edge.**
+3. **Blind commands mid-burst** — when the robot's marker dropped during a burst, the hold logic kept sending the last command for 3 frames (+ deadman) while the robot kept moving: that's the arena-box overrun. **Fix: bursts cut immediately at miss ≥ 2.** Driving bursts also bail out if the aim error blows past 0.8×tolerance (curving motors) — the "cross-wise" travel is now bounded per leg and corrected at the next stop.
+
+**Verification (simulation with 3-frame reading lag, 2–4° noise, fast 150–200°/s spins, curving drives, dropouts):** rate learning converges (60→44 vs true 40; 8→15 vs 18 cm/s); pure straight drive stops 11.9 cm from target (tol 12); curving robot (40°/s drift) still arrives; 0.4 s marker dropout mid-run: burst cut, arrives after recovery; back-axis regression passes. Commit `830bfaa`.
+
+**Latency facts for the logbook:** end-to-end chain = exposure + camera buffer + JPEG + detect + decide + UDP ≈ 100–300 ms; at 18 cm/s that's 2–5 cm of travel per decision — the controller is now designed to tolerate it (measure only when still; size bursts to stop short; never command blind). Venue tips: lock the C920 exposure (fast shutter = less blur AND less lag), plenty of light.
+
+**Next:** the ladder again — expect small decisive turns sized to the error, drives that stop AT the card, and the robot staying inside the box even when detection glitches.
+
+---
+
+## 2026-11-13 — Bidirectional radio (ACK) + configurable degree/cm stepping
+
+**User request:** (1) turning as degree steps with visual feedback before the next step, no full circles; (2) ESP acknowledges every command; (3) forward moves also in small cm steps; (4) step sizes configurable in the app.
+
+**Changes (commit `ca4f76d`):**
+- **ACK protocol**: every command now carries a sequence number (`F#12`, `V400#13`); the NodeMCU replies `A12` to the sender. Plain commands (drive_test.py) unchanged. The laptop tracks ACK age — readout shows `ACK 12 ms OK` / `ACK LOST`, and **>1 s without ACK while running auto-pauses** with a banner. This closes the blind spot of the deadman (which only detects laptop→robot loss).
+- **Degree stepping**: new "Turn step (deg)" entry (default 30°) — a turn burst never exceeds it; a 120° error becomes ~4 deliberate steps, each followed by stop-look-measure. Banner shows `TURN step 3 (err +41 deg)`.
+- **cm stepping**: "Drive step (cm)" entry (default 10) caps each drive burst; combined with the learned drive speed and tolerance-edge sizing, approaches happen in short legs.
+- Step counters in the readout (`steps: 3 turn / 7 drive`); both step sizes persisted in `nav_settings.json`.
+
+**Verification:** ACK round-trip against a firmware-behaved fake robot (seq tracked, 0 ms); silent robot → `ack_ok()` False after timeout; turn cap exact (err 120 @100°/s → 0.30 s burst); drive cap ≤10 cm; full stepped convergence with noise+lag: ARRIVED, 3 turn + N drive steps, rates converged (60→126°/s vs 150, 8→15 cm/s vs 18); settings round-trip for the new keys. Firmware compile-verified for `nodemcuv2`.
+
+**⚠ Action needed: re-flash the robot** (PlatformIO → Upload) — the ACK firmware is required for the new app to see ACKs (the app works without it, but shows ACK LOST and will auto-pause).
+
+**Next:** re-flash → ladder → 5-in-a-row → merge.
+
+---
+
+## 2026-11-13 — Branch round 4: firmware-timed pulses (`esp-pulse-exec`)
+
+**Why:** "robot not following commands" — with bursts timed on the LAPTOP, a 150 ms pulse really left as one or two 100 ms send slots plus Wi-Fi jitter, so short turns systematically overshot (or vanished into the slot). Fix is architectural, not tuning: the ESP8266 now owns burst timing.
+
+**Protocol (additive — old commands work byte-for-byte as before):**
+- `R150` / `L60` / `F300` (letter + ms) = timed pulse: firmware runs the move and self-stops off `millis()`. Clamped 50–2000 ms, so even a rogue sender can't ask for an unbounded move. Any new command cancels a running pulse (`S` = instant stop).
+- `K` = keepalive: feeds the deadman and the ACKs, never touches motors or a running pulse.
+- Deadman unchanged (600 ms); radio silence also kills a running pulse.
+
+**Laptop (`main.py`):** decision tick returns ONE pulse (e.g. `L333`); the send path fires pulses the moment they're decided (no send-slot wait) with `V` speed FIRST so the pulse never runs at a stale PWM; mid-pulse ticks stream `K`; a marker blink replays `K` (never re-sends — that would restart the pulse); 2 blind frames → `S` cut. Rate learner now divides by the COMMANDED duration (`_slice_s`) — exact, because the firmware executes it exactly.
+
+**Rollback:** new firmware + old laptop = today's behavior exactly (bare letters unchanged). Order matters: flash the firmware FIRST, then run the new Python. `git switch nav-autoscale-control` reverts the laptop alone, no reflash. `pulse_test.py` (wheels up) proves the flash in one shot: `R150` then laptop silence — wheels must stop at ~150 ms, not ~600.
+
+**Verification:** headless Navigator sim — turn pulse `L333` → `K`-only mid-pulse → learned rate 153°/s (= 0.35·270 + 0.65·90, exact-dt learning) → drive pulse `F667` → ARRIVED latch; blind miss=1 → `K`, miss=2 → `S`, LOST → settle-recover. `py_compile` on all three scripts.
+
+**Next:** bench (`pulse_test.py`) → ladder on the floor. If the floor run is somehow worse: revert Python only, firmware can stay.

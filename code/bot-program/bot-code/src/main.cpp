@@ -14,6 +14,14 @@
 // ("A12") - bidirectional radio, so the laptop can tell a live link from
 // a dead one. Plain commands without "#n" (drive_test.py) still work.
 // If commands stop for 600 ms the robot stops BY ITSELF (deadman).
+//
+// TIMED PULSES: "R150" / "L60" / "F300" (letter + milliseconds) run the
+// move for exactly that long and stop ON BOARD - burst timing then lives
+// here, safe from laptop send slots and Wi-Fi jitter. A new command (e.g.
+// "S") cancels a running pulse at once; "K" is a keepalive that feeds the
+// deadman and the ACKs WITHOUT touching motors or a running pulse.
+// Durations are clamped to 50-2000 ms, so even a rogue sender can't ask
+// for an unbounded move.
 
 // ---- pins (same wiring as the motor test) ----
 #define ENA D1   // left motor speed  (PWM)
@@ -36,6 +44,7 @@ int driveSpeed = 400;
 
 WiFiUDP udp;
 unsigned long lastCmdMs = 0;       // 0 = no command received yet
+unsigned long pulseStopAt = 0;     // 0 = no timed pulse running
 char lastState = 'S';              // for printing state changes only
 
 void motorsStop() {
@@ -100,6 +109,7 @@ void setup() {
   Serial.printf("Hotspot : \"%s\" (open, no password)\n", AP_SSID);
   Serial.printf("Robot IP: %s  port %u\n", WiFi.softAPIP().toString().c_str(), UDP_PORT);
   Serial.printf("Deadman : robot self-stops after %d ms of silence\n", DEADMAN_MS);
+  Serial.println(F("Pulses : 'R150' runs 150 ms on-board; 'K' = keepalive"));
   Serial.println(F("On the laptop: join Wi-Fi \"VisionBot\", then run drive_test.py"));
   Serial.println(F("Pins: ENA=D1 ENB=D2 IN1=D5 IN2=D6 IN3=D7 IN4=D0"));
   Serial.println();
@@ -124,8 +134,20 @@ void loop() {
         driveSpeed = constrain(v, 0, 1023);
         applyCommand(lastState);     // re-apply current move at the new speed
         Serial.printf("[speed] %d/1023 (%d%%)\n", driveSpeed, driveSpeed * 100 / 1023);
+      } else if (buf[0] == 'K') {
+        // keepalive: acks + deadman only. Motors and any RUNNING pulse
+        // stay exactly as they are (that's the whole point of pulses).
+      } else if (strlen(buf) > 1 && buf[1] >= '0' && buf[1] <= '9' &&
+                 strchr("FBLR", buf[0])) {
+        // timed pulse "R150": move for N ms, then self-stop right here
+        long ms = atol(buf + 1);
+        ms = constrain(ms, 50, 2000);
+        applyCommand(buf[0]);        // start the move
+        pulseStopAt = millis() + (unsigned long)ms;
+        Serial.printf("[pulse] %c for %ld ms (on-board timer)\n", buf[0], ms);
       } else {
-        applyCommand(buf[0]);        // F B L R S
+        applyCommand(buf[0]);        // F B L R S - streaming style
+        pulseStopAt = 0;             // a plain command cancels any pulse
       }
       if (seq >= 0) {                // acknowledge back to the sender
         char ack[12];
@@ -138,6 +160,14 @@ void loop() {
     lastCmdMs = millis();
   }
 
+  // ---- timed pulse: the on-board clock ends the move, not the laptop ----
+  if (pulseStopAt != 0 && (long)(millis() - pulseStopAt) >= 0) {
+    motorsStop();
+    lastState = 'S';
+    pulseStopAt = 0;
+    Serial.println(F("[pulse] done -> STOP"));
+  }
+
   // ---- deadman: no news = stop ----
   if (lastCmdMs != 0 && millis() - lastCmdMs > DEADMAN_MS) {
     if (lastState != 'S') {
@@ -146,5 +176,6 @@ void loop() {
     motorsStop();
     lastState = 'S';
     lastCmdMs = 0;                 // don't retrigger every loop
+    pulseStopAt = 0;               // radio silence also kills a pulse
   }
 }
