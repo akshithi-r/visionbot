@@ -273,6 +273,10 @@ class ArenaMap:
     def __init__(self, corner_marker_cm=6.0, cm_per_px=0.05):
         self.corner_marker_cm = float(corner_marker_cm)
         self.cm_per_px = float(cm_per_px)
+        self.width_override = None   # typed true frame size (cm), None = auto
+        self.height_override = None
+        self.auto_w = 0.0            # marker-derived sizes (for comparison)
+        self.auto_h = 0.0
         self.width_cm = 0.0
         self.height_cm = 0.0
         self.last_scale = None       # cm/px derived from the markers (cached)
@@ -280,9 +284,12 @@ class ArenaMap:
         self.last_good_H = None      # cache while a corner is hidden
         self.corner_error = None     # "mirrored" if 30-33 taped in wrong order
 
-    def configure(self, corner_marker_cm, cm_per_px):
+    def configure(self, corner_marker_cm, cm_per_px,
+                  width_override=None, height_override=None):
         self.corner_marker_cm = float(corner_marker_cm)
         self.cm_per_px = float(cm_per_px)
+        self.width_override = width_override
+        self.height_override = height_override
 
     def update(self, found):
         """Call once per frame with all detected markers."""
@@ -317,9 +324,12 @@ class ArenaMap:
                     # changes (a bumped camera) within a few frames
                 self.last_scale += self.SCALE_SMOOTH * (raw_scale - self.last_scale)
             scale = self.last_scale
-            # arena size in cm measured between the taped markers
-            self.width_cm = float(np.linalg.norm(centers[1] - centers[0])) * scale
-            self.height_cm = float(np.linalg.norm(centers[3] - centers[0])) * scale
+            # marker-derived size (auto mode + cross-check for typed mode)
+            self.auto_w = float(np.linalg.norm(centers[1] - centers[0])) * scale
+            self.auto_h = float(np.linalg.norm(centers[3] - centers[0])) * scale
+            # typed true size wins if provided (marker-CENTER distances!)
+            self.width_cm = self.width_override or self.auto_w
+            self.height_cm = self.height_override or self.auto_h
             dst = np.array([[0, 0], [self.width_cm, 0],
                             [self.width_cm, self.height_cm],
                             [0, self.height_cm]], dtype=np.float32)
@@ -721,6 +731,8 @@ class VisionBotApp(ctk.CTk):
 
         self.e_head = entry_row("Heading offset (deg)", "0", r); r += 1
         self.e_csize = entry_row("Corner marker (cm)", "6", r); r += 1
+        self.e_w = entry_row("Frame W cm (empty=auto)", "", r); r += 1
+        self.e_h = entry_row("Frame H cm (empty=auto)", "", r); r += 1
         self.e_scale = entry_row("cm/px (no corners)", "0.05", r); r += 1
         ctk.CTkButton(panel, text="Ruler check: card 30 cm from robot",
                       height=30, command=self._ruler_check).grid(
@@ -752,8 +764,17 @@ class VisionBotApp(ctk.CTk):
         self.nav.stop_tol = float(self.stoptol.get())
         self.nav.turn_invert = bool(self.invert.get())
         self.nav.heading_offset = self._f(self.e_head, 0.0)
+
+        def _opt(entry):                 # optional typed frame size, cm
+            try:
+                v = float(entry.get())
+                return v if 20.0 <= v <= 400.0 else None
+            except ValueError:
+                return None
+
         self.arena.configure(self._f(self.e_csize, 6.0),
-                             self._f(self.e_scale, 0.05))
+                             self._f(self.e_scale, 0.05),
+                             _opt(self.e_w), _opt(self.e_h))
 
     def _speed_changed(self, value):
         pct = int(value)
@@ -929,6 +950,16 @@ class VisionBotApp(ctk.CTk):
                              " cm) - re-tape: equal DIAGONALS, then rerun the "
                              "30 cm check",
                         text_color="#e0a020")
+                elif self.arena.width_override and self.arena.auto_w > 0 and \
+                        abs(self.arena.auto_w / self.arena.width_override
+                            - 1.0) > 0.15:
+                    self.banner.configure(
+                        text=f"Typed frame {self.arena.width_override:.0f}x"
+                             f"{self.arena.height_override:.0f} differs a lot "
+                             f"from marker-derived {self.arena.auto_w:.0f}x"
+                             f"{self.arena.auto_h:.0f} - typed must be the "
+                             "MARKER-CENTER distances of a true rectangle",
+                        text_color="#e0a020")
 
                 seen_r, seen_t = ROBOT_ID in found, TARGET_ID in found
                 robot_cm = heading = target_cm = None
@@ -989,8 +1020,14 @@ class VisionBotApp(ctk.CTk):
             self.banner.configure(text=text, text_color=color)
 
         if self.arena.mode == "corners":
-            arena_txt = (f"corners (live)  W{self.arena.width_cm:.0f} x "
-                         f"H{self.arena.height_cm:.0f} cm derived")
+            if self.arena.width_override:
+                arena_txt = (f"corners TYPED {self.arena.width_cm:.0f} x "
+                             f"{self.arena.height_cm:.0f} cm "
+                             f"(auto {self.arena.auto_w:.0f} x "
+                             f"{self.arena.auto_h:.0f})")
+            else:
+                arena_txt = (f"corners (live)  W{self.arena.width_cm:.0f} x "
+                             f"H{self.arena.height_cm:.0f} cm derived")
         elif self.arena.mode == "cached":
             arena_txt = "corners (cached homography)"
         elif self.arena.last_scale:
