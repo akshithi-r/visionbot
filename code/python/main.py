@@ -31,6 +31,7 @@ Run:  .venv\\Scripts\\python main.py        (Windows)
 Robot Wi-Fi "VisionBot" joined first, robot powered, camera rig up.
 """
 
+import json
 import math
 import multiprocessing as mp
 import os
@@ -521,6 +522,7 @@ class Navigator:
         self._phase_t = 0.0         # seconds into the current phase
         self._slice_s = 0.0         # planned length of the current burst
         self._heading_before = None # heading at turn-burst start (rate learn)
+        self._turn_dir = None       # committed turn direction (L/R)
 
     # ---- helpers ----
     def _smooth_heading(self, heading):
@@ -596,14 +598,27 @@ class Navigator:
             self.last_cmd = "S"
             if self._phase_t < self.SETTLE_S:
                 return "S", self.speed
-            if abs(self.err_deg) >= self.angle_tol:
-                dur = abs(self.err_deg) / self.turn_rate
+            a = abs(self.err_deg)
+            if a >= self.angle_tol:
+                # aim a little SHORT of the line - overshooting past it
+                # (worst: past the +/-180 back axis) flips the sign and
+                # the robot circles endlessly
+                dur = (a - 5.0) / self.turn_rate
+                if a > 150.0:
+                    dur = min(dur, 0.5)     # approach the back axis in steps
                 self._slice_s = min(max(dur, self.TURN_MIN_S), self.TURN_MAX_S)
                 self._heading_before = self._heading_now
+                # Near +/-180 BOTH directions are equally short - commit to
+                # one instead of re-choosing from the noisy sign each burst
+                if a > 150.0 and self._turn_dir in ("L", "R"):
+                    cmd = self._turn_dir
+                else:
+                    cmd = self._turn_cmd(self.err_deg)
+                self._turn_dir = cmd
                 self.state = "TURNING"
                 self._phase_t = 0.0
-                self.last_cmd = self._turn_cmd(self.err_deg)
-                return self.last_cmd, self._v_turn()
+                self.last_cmd = cmd
+                return cmd, self._v_turn()
             self._slice_s = self.DRIVE_S
             self.state = "DRIVING"
             self._phase_t = 0.0
@@ -622,7 +637,7 @@ class Navigator:
                                              self.RATE_MIN), self.RATE_MAX)
                 self._settle()
                 return "S", self.speed
-            self.last_cmd = self._turn_cmd(self.err_deg)
+            self.last_cmd = self._turn_dir or self._turn_cmd(self.err_deg)
             return self.last_cmd, self._v_turn()
 
         # ---- driving burst ----
@@ -714,9 +729,11 @@ class VisionBotApp(ctk.CTk):
         self._corner_sizes = None   # per-corner mapped size (taping health)
 
         self._build_ui()
+        self._load_settings()      # frame size, marker sizes, offsets... all
         self.protocol("WM_DELETE_WINDOW", self._shutdown)
         self.bind("<space>", lambda e: self._start())
         self.bind("<Escape>", lambda e: self._estop())
+        self._after_id = None
         self.after(30, self._tick)
 
     # ------------------------------------------------ UI construction
@@ -828,6 +845,63 @@ class VisionBotApp(ctk.CTk):
                           padx=12, pady=(10, 12))
         self.readout.configure(height=210)
 
+    # ------------------------------------------------ settings file
+    SETTINGS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 "nav_settings.json")
+
+    def _save_settings(self):
+        """Keep the hard-won calibration across restarts."""
+        try:
+            data = {"speed": int(self.speed.get()),
+                    "angle_tol": int(self.angle.get()),
+                    "stop_tol": int(self.stoptol.get()),
+                    "invert": bool(self.invert.get()),
+                    "heading_offset": self.e_head.get(),
+                    "robot_h": self.e_hgt.get(),
+                    "corner_cm": self.e_csize.get(),
+                    "frame_w": self.e_w.get(), "frame_h": self.e_h.get(),
+                    "cm_per_px": self.e_scale.get(), "ip": self.e_ip.get()}
+            with open(self.SETTINGS_PATH, "w") as fp:
+                json.dump(data, fp, indent=1)
+        except Exception as exc:
+            print(f"[settings] save failed: {exc}")
+
+    def _load_settings(self):
+        try:
+            with open(self.SETTINGS_PATH) as fp:
+                d = json.load(fp)
+        except Exception:
+            return
+
+        def put(entry, key):
+            if key in d and str(d[key]).strip():
+                entry.delete(0, "end")
+                entry.insert(0, str(d[key]))
+
+        for entry, key in ((self.e_head, "heading_offset"),
+                           (self.e_hgt, "robot_h"),
+                           (self.e_csize, "corner_cm"),
+                           (self.e_w, "frame_w"), (self.e_h, "frame_h"),
+                           (self.e_scale, "cm_per_px"), (self.e_ip, "ip")):
+            put(entry, key)
+        if "speed" in d:
+            self.speed.set(min(100, max(25, int(d["speed"]))))
+            self.speed_lab.configure(text=f"{int(self.speed.get())}%")
+        if "angle_tol" in d:
+            self.angle.set(int(d["angle_tol"]))
+            self.angle_lab.configure(text=f"{int(self.angle.get())} deg")
+        if "stop_tol" in d:
+            self.stoptol.set(int(d["stop_tol"]))
+            self.stoptol_lab.configure(text=f"{int(self.stoptol.get())} cm")
+        if d.get("invert"):
+            self.invert.select()
+        # programmatic .set() does NOT fire the slider commands - propagate
+        self._speed_changed(self.speed.get())
+        self._angle_changed(self.angle.get())
+        self._stoptol_changed(self.stoptol.get())
+        self._nav_params_changed()
+        print("[settings] loaded from nav_settings.json")
+
     # ------------------------------------------------ helpers
     def _f(self, entry, default):
         try:
@@ -928,6 +1002,7 @@ class VisionBotApp(ctk.CTk):
         self.armed = True
         self._v_sent = self.nav.speed
         self.link.send_speed(self.nav.speed)
+        self._save_settings()
         print(f"[nav] START - target {ip}:{ROBOT_PORT}, "
               f"speed {self.nav.speed}/1023")
 
@@ -936,6 +1011,7 @@ class VisionBotApp(ctk.CTk):
         self.nav.state = "IDLE"
         if self.link:
             self.link.stop_burst()
+        self._save_settings()
         print("[nav] paused")
 
     def _estop(self):
@@ -1093,7 +1169,7 @@ class VisionBotApp(ctk.CTk):
                 self._v_sent = v
             self.last_send = now
 
-        self.after(30, self._tick)
+        self._after_id = self.after(30, self._tick)
 
     def _show(self, frame):
         target_w = 880
@@ -1161,6 +1237,12 @@ class VisionBotApp(ctk.CTk):
         if self.feed is not None:
             self.feed.shutdown()
             self.feed = None
+        self._save_settings()
+        if self._after_id is not None:
+            try:
+                self.after_cancel(self._after_id)
+            except Exception:
+                pass
         self.destroy()
 
 
